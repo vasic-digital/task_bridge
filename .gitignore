@@ -1,0 +1,39 @@
+# task_bridge .gitignore (constitution §11.4.30)
+
+# --- secrets / sensitive (§11.4.10) — NEVER versioned ---
+.env
+.env.*
+!.env.example
+*.env
+secrets/
+*.pem
+*.key
+
+# --- build artefacts ---
+/bin/
+/dist/
+/out/
+# compiled binaries at repo root (anchored — must NOT ignore cmd/task_bridge*/ source dirs)
+/task_bridge
+/task_bridged
+*.exe
+*.test
+*.out
+
+# --- Go caches / vendor (regenerable via `go mod download`; §11.4.77) ---
+/vendor/
+go.work
+go.work.sum
+
+# --- local SQLite working files (consumer DB lives in the consumer repo) ---
+*.db-wal
+*.db-shm
+
+# --- temp / OS / IDE ---
+*.tmp
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+coverage.out

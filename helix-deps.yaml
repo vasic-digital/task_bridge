@@ -1,0 +1,20 @@
+# task_bridge dependency manifest (constitution §11.4.31).
+#
+# Declares this submodule's own-org Git SSH dependencies so a consuming project
+# can reconstruct the dependency graph from its root. Third-party deps (e.g.
+# raksul/go-clickup) are pulled via the Go module system, NOT listed here as
+# own-org submodules (§11.4.74 catalogue-first: the ClickUp transport is a
+# vendored third-party MIT library, not an own-org repo).
+
+schema_version: 1
+
+deps: []   # P1 scaffold: no own-org submodule dependencies yet.
+
+transitive_handling:
+  recursive: true
+  conflict_resolution: operator-required
+
+language_specific_subtree: false
+
+# Third-party (informational; resolved by `go mod`, not a submodule):
+#   - github.com/raksul/go-clickup  (MIT)  -- ClickUp API v2 transport

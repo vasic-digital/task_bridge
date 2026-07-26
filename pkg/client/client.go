@@ -68,7 +68,7 @@ func (stubClient) GetTask(context.Context, string) (Task, error) {
 func (stubClient) CreateTask(context.Context, string, Task) (Task, error) {
 	return Task{}, ErrNotImplemented
 }
-func (stubClient) UpdateTask(context.Context, Task) error        { return ErrNotImplemented }
+func (stubClient) UpdateTask(context.Context, Task) error { return ErrNotImplemented }
 func (stubClient) SetCustomField(context.Context, string, string, string) error {
 	return ErrNotImplemented
 }

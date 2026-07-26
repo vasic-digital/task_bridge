@@ -22,6 +22,21 @@ set -euo pipefail
 APPLY=""
 [ "${1:-}" = "--apply" ] && APPLY="--apply"
 
-# The binary reads CLICKUP_* + TASK_BRIDGE_DB from the environment.
-# It never prints the token value (§11.4.10).
-exec task_bridge reconcile ${APPLY}
+# Resolve the task_bridge binary WITHOUT requiring a system-PATH install
+# (decoupled, §11.4.28): TASK_BRIDGE_BIN override -> the repo-local build next
+# to this script (tools/task_bridge/bin/) -> a PATH install.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -n "${TASK_BRIDGE_BIN:-}" ] && [ -x "${TASK_BRIDGE_BIN}" ]; then
+	TB="${TASK_BRIDGE_BIN}"
+elif [ -x "${SCRIPT_DIR}/../bin/task_bridge" ]; then
+	TB="${SCRIPT_DIR}/../bin/task_bridge"
+elif command -v task_bridge >/dev/null 2>&1; then
+	TB="task_bridge"
+else
+	echo "task_bridge_sync.sh: task_bridge binary not found (build: go build -o tools/task_bridge/bin/task_bridge ./cmd/task_bridge)" >&2
+	exit 3
+fi
+
+# The binary reads CLICKUP_API_KEY / CLICKUP_LIST_ID / TASK_BRIDGE_DB from the
+# environment (consumer-injected). It never prints the token value (§11.4.10).
+exec "$TB" reconcile ${APPLY}

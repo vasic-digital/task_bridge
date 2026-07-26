@@ -7,13 +7,13 @@
 // injected by the consumer at runtime through the Config struct below:
 //
 //   - credentials  -> read by the consumer from its own .env / secret store and
-//                     passed in via Config.APIToken (the value is NEVER logged,
-//                     NEVER persisted by this engine — §11.4.10).
+//     passed in via Config.APIToken (the value is NEVER logged,
+//     NEVER persisted by this engine — §11.4.10).
 //   - board/folder -> the consumer passes the ClickUp folder/board URLs (or
-//                     pre-resolved IDs) via Config.FolderURL / Config.BoardURL;
-//                     pkg/resolver turns URLs into IDs by probing the API.
+//     pre-resolved IDs) via Config.FolderURL / Config.BoardURL;
+//     pkg/resolver turns URLs into IDs by probing the API.
 //   - item key     -> Config.ItemKeyCustomField (the ATM_ID-style custom field
-//                     used as the immutable cross-system key).
+//     used as the immutable cross-system key).
 //
 // A consumer wires task_bridge by constructing a Config and calling the engine;
 // the engine reaches back into the consumer ONLY through this struct.
@@ -58,9 +58,9 @@ type Config struct {
 	ItemKeyCustomField string
 
 	// --- sync behaviour ---
-	DeleteBehavior   DeleteBehavior // operator default: NeverAutoDeleteRemote
-	ReconcileEvery   time.Duration  // operator default: 10 * time.Minute
-	DryRun           bool           // default true — never pollute the board
+	DeleteBehavior DeleteBehavior // operator default: NeverAutoDeleteRemote
+	ReconcileEvery time.Duration  // operator default: 10 * time.Minute
+	DryRun         bool           // default true — never pollute the board
 
 	// --- local SSoT (injected path; engine never assumes a location) ---
 	// DBPath is the consumer's workable-items SQLite DB file. The engine reads
@@ -79,7 +79,7 @@ func Defaults() Config {
 	return Config{
 		DeleteBehavior: NeverAutoDeleteRemote, // §9 safe default
 		ReconcileEvery: 10 * time.Minute,      // operator-decided cadence
-		DryRun:         true,                   // never pollute the board by default
+		DryRun:         true,                  // never pollute the board by default
 	}
 }
 

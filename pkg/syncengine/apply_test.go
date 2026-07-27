@@ -27,6 +27,9 @@ type mockClient struct {
 	createReq []client.Task // every CreateTask arg (including failed attempts)
 	updateReq []client.Task // every UpdateTask arg (including failed attempts)
 	deleteReq []string      // every DeleteTask arg — MUST stay empty (§9/§11.4.122)
+	addTagReq [][2]string   // every AddTag {taskID, tag} — the status-label path
+	remTagReq [][2]string   // every RemoveTag {taskID, tag} — stale-label removal
+	tagErr    error         // when set, every AddTag/RemoveTag fails with this
 	listCalls int
 }
 
@@ -59,6 +62,16 @@ func (m *mockClient) SetCustomField(context.Context, string, string, string) err
 	return client.ErrNotImplemented
 }
 
+func (m *mockClient) AddTag(_ context.Context, taskID, tag string) error {
+	m.addTagReq = append(m.addTagReq, [2]string{taskID, tag})
+	return m.tagErr
+}
+
+func (m *mockClient) RemoveTag(_ context.Context, taskID, tag string) error {
+	m.remTagReq = append(m.remTagReq, [2]string{taskID, tag})
+	return m.tagErr
+}
+
 func (m *mockClient) DeleteTask(_ context.Context, taskID string) error {
 	m.deleteReq = append(m.deleteReq, taskID)
 	return nil
@@ -80,10 +93,14 @@ func TestApplyNeverDeletesSkipsInSyncPushesDriftAndCreate(t *testing.T) {
 		{Key: "ATM-200", Status: "Queued", Title: "local only -> CREATE"}, // -> CREATE (CreateTask)
 	}
 	remote := []client.Task{
-		{ID: "t1", Name: "[ATM-100] already in sync", Status: "Queued"}, // in-sync
-		{ID: "t2", Name: "[ATM-101] drifted", Status: "Queued"},         // drift (want In progress)
-		{ID: "t9", Name: "[ATM-999] keyed orphan", Status: "Queued"},    // INVESTIGATE (no call)
-		{ID: "tu", Name: "free-form no key", Status: "Queued"},          // UNKEYED (no call)
+		// Post-grouping: in-sync means the remote COLUMN equals the grouped target
+		// AND the exact status:<word> label is present. local ATM-100 "Queued" ->
+		// "to do" + "status:queued" (in-sync, skipped); ATM-101 "In progress" ->
+		// want "in progress" but remote is "to do" with no label (column + label drift).
+		{ID: "t1", Name: "[ATM-100] already in sync", Status: "to do", Tags: []string{"status:queued"}}, // in-sync
+		{ID: "t2", Name: "[ATM-101] drifted", Status: "to do"},                                          // drift (want "in progress" + label)
+		{ID: "t9", Name: "[ATM-999] keyed orphan", Status: "to do"},                                     // INVESTIGATE (no call)
+		{ID: "tu", Name: "free-form no key", Status: "to do"},                                           // UNKEYED (no call)
 	}
 	plan := PlanReconcile(local, remote)
 	// Sanity: the plan must have the buckets the assertions below depend on.
@@ -127,6 +144,16 @@ func TestApplyNeverDeletesSkipsInSyncPushesDriftAndCreate(t *testing.T) {
 	}
 	if res.Created != 1 || res.Updated != 1 || len(res.Errors) != 0 {
 		t.Fatalf("(d) result = created:%d updated:%d errors:%v, want 1/1/none", res.Created, res.Updated, res.Errors)
+	}
+	// (f) the exact-status LABEL is reconciled via the dedicated add-tag endpoint
+	// (ClickUp's update body ignores tags): the drifted row t2 gets its status
+	// label added; the in-sync row t1 (already labelled) gets NO tag call, and
+	// nothing is ever REMOVED here (no superseded status label present).
+	if len(mc.addTagReq) != 1 || mc.addTagReq[0][0] != "t2" || mc.addTagReq[0][1] != "status:In progress" {
+		t.Fatalf("(f) addTagReq = %v, want a single {t2, status:In progress}", mc.addTagReq)
+	}
+	if len(mc.remTagReq) != 0 {
+		t.Fatalf("(f) remTagReq = %v, want none (no superseded status label to remove)", mc.remTagReq)
 	}
 }
 
@@ -282,4 +309,6 @@ func (loopingClient) UpdateTask(context.Context, client.Task) error { return cli
 func (loopingClient) SetCustomField(context.Context, string, string, string) error {
 	return client.ErrNotImplemented
 }
-func (loopingClient) DeleteTask(context.Context, string) error { return client.ErrNotImplemented }
+func (loopingClient) AddTag(context.Context, string, string) error    { return client.ErrNotImplemented }
+func (loopingClient) RemoveTag(context.Context, string, string) error { return client.ErrNotImplemented }
+func (loopingClient) DeleteTask(context.Context, string) error        { return client.ErrNotImplemented }

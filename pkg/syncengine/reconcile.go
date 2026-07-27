@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/vasic-digital/task_bridge/pkg/client"
 	"github.com/vasic-digital/task_bridge/pkg/mapper"
@@ -47,12 +48,18 @@ type PlanEntry struct {
 	RemoteStatus string     `json:"remote_status,omitempty"` // ClickUp status name
 	RemoteName   string     `json:"remote_name,omitempty"`   // ClickUp task title
 	// InSync is the TYPED, load-bearing drift flag for UPDATE rows: true when the
-	// remote status already equals the local status. Apply and the CLI report key
-	// their skip/push decision off THIS field, never off the human-readable
-	// Detail string (N3 — no fragile string coupling). Only ever set on UPDATE
-	// rows; false (and omitted) for every other bucket.
-	InSync bool   `json:"in_sync,omitempty"`
-	Detail string `json:"detail,omitempty"` // human reason (display only)
+	// remote already matches the local BOTH in grouped column AND in the exact
+	// status:<word> label. Apply and the CLI report key their skip/push decision
+	// off THIS field, never off the human-readable Detail string (N3 — no fragile
+	// string coupling). Only ever set on UPDATE rows; false (and omitted) for
+	// every other bucket.
+	InSync bool `json:"in_sync,omitempty"`
+	// RemoteTags is the matched remote task's current tag set (UPDATE rows only).
+	// Apply uses it to reconcile the status:<word> label without an extra GET:
+	// add the wanted label if absent, remove a SUPERSEDED status label if present.
+	// Type/other tags are never touched (mapper.IsStatusLabel gates removal).
+	RemoteTags []string `json:"remote_tags,omitempty"`
+	Detail     string   `json:"detail,omitempty"` // human reason (display only)
 }
 
 // Plan is the bucketed reconcile diff.
@@ -152,14 +159,23 @@ func PlanReconcile(local []mapper.LocalItem, remote []client.Task) Plan {
 			LocalStatus:  li.Status,
 			RemoteStatus: t.Status,
 			RemoteName:   t.Name,
+			RemoteTags:   t.Tags,
 		}
-		if mapper.RemoteStatusMatchesLocal(t.Status, li.Status) {
+		colMatch := mapper.RemoteStatusMatchesLocal(t.Status, li.Status)
+		wantLbl, hasLbl := mapper.StatusLabel(li.Status)
+		lblMatch := !hasLbl || remoteHasTag(t.Tags, wantLbl)
+		switch {
+		case colMatch && lblMatch:
 			e.InSync = true
-			e.Detail = "status in-sync"
-		} else if want, okm := mapper.StatusToRemote(li.Status); okm {
-			e.Detail = fmt.Sprintf("status-drift: remote=%q want=%q", t.Status, want)
-		} else {
-			e.Detail = fmt.Sprintf("local status %q not in vocab", li.Status)
+			e.Detail = "status in-sync (column + label)"
+		case !colMatch:
+			if want, okm := mapper.StatusColumn(li.Status); okm {
+				e.Detail = fmt.Sprintf("status-drift: remote=%q want-column=%q label=%q", t.Status, want, wantLbl)
+			} else {
+				e.Detail = fmt.Sprintf("local status %q not in vocab", li.Status)
+			}
+		default: // column matches but the status label is missing/stale
+			e.Detail = fmt.Sprintf("label-drift: column ok, missing status label %q", wantLbl)
 		}
 		plan.Update = append(plan.Update, e)
 	}
@@ -182,6 +198,17 @@ func PlanReconcile(local []mapper.LocalItem, remote []client.Task) Plan {
 	sortEntries(plan.Investigate)
 	sortEntries(plan.Unkeyed)
 	return plan
+}
+
+// remoteHasTag reports whether tags contains want (case-insensitive; ClickUp
+// lowercases tag names, so a case-blind compare is required).
+func remoteHasTag(tags []string, want string) bool {
+	for _, t := range tags {
+		if strings.EqualFold(strings.TrimSpace(t), strings.TrimSpace(want)) {
+			return true
+		}
+	}
+	return false
 }
 
 func sortEntries(es []PlanEntry) {
@@ -230,8 +257,9 @@ func Apply(ctx context.Context, cl client.Client, mp mapper.Mapper, listID strin
 	}
 
 	for _, e := range plan.Update {
-		// Only push when the row is actually drifted. Keyed off the TYPED InSync
-		// flag, never the human-readable Detail string (N3).
+		// Skip only when BOTH the grouped column AND the status label already
+		// match (InSync). Keyed off the TYPED InSync flag, never the human-
+		// readable Detail string (N3).
 		if e.InSync {
 			continue
 		}
@@ -244,13 +272,44 @@ func Apply(ctx context.Context, cl client.Client, mp mapper.Mapper, listID strin
 			res.Errors = append(res.Errors, fmt.Sprintf("UPDATE %s: map: %v", e.Key, err))
 			continue
 		}
-		if err := cl.UpdateTask(ctx, client.Task{
-			ID: e.TaskID, Name: rt.Name, Description: rt.Description, Status: rt.Status, Tags: rt.Tags,
-		}); err != nil {
-			res.Errors = append(res.Errors, fmt.Sprintf("UPDATE %s: %v", e.Key, err))
-			continue
+		touched := false
+		// (1) column: push only when the grouped column drifted (the update body
+		// DOES honour `status`, verified live 2026-07-27).
+		if !mapper.RemoteStatusMatchesLocal(e.RemoteStatus, li.Status) {
+			if err := cl.UpdateTask(ctx, client.Task{
+				ID: e.TaskID, Name: rt.Name, Description: rt.Description, Status: rt.Status, Tags: rt.Tags,
+			}); err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("UPDATE %s: %v", e.Key, err))
+				continue
+			}
+			touched = true
 		}
-		res.Updated++
+		// (2) status label: ClickUp's update body IGNORES tags (verified live
+		// 2026-07-27), so the exact status:<word> label MUST be reconciled through
+		// the dedicated add/remove-tag endpoints. Remove any SUPERSEDED status
+		// label, then add the wanted one if absent. Type/other tags are never
+		// touched (mapper.IsStatusLabel gates removal).
+		if wantLbl, hasLbl := mapper.StatusLabel(li.Status); hasLbl {
+			for _, tg := range e.RemoteTags {
+				if mapper.IsStatusLabel(tg) && !strings.EqualFold(strings.TrimSpace(tg), wantLbl) {
+					if err := cl.RemoveTag(ctx, e.TaskID, tg); err != nil {
+						res.Errors = append(res.Errors, fmt.Sprintf("UPDATE %s: remove stale label %q: %v", e.Key, tg, err))
+						continue
+					}
+					touched = true
+				}
+			}
+			if !remoteHasTag(e.RemoteTags, wantLbl) {
+				if err := cl.AddTag(ctx, e.TaskID, wantLbl); err != nil {
+					res.Errors = append(res.Errors, fmt.Sprintf("UPDATE %s: add label %q: %v", e.Key, wantLbl, err))
+					continue
+				}
+				touched = true
+			}
+		}
+		if touched {
+			res.Updated++
+		}
 	}
 	return res, nil
 }

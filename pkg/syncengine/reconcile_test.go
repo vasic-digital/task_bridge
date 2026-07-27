@@ -20,11 +20,13 @@ func TestPlanReconcileBuckets(t *testing.T) {
 		{Key: "SPK-010", Status: "Fixed (→ Fixed.md)", Title: "local only spk -> CREATE"},
 	}
 	remote := []client.Task{
-		{ID: "t1", Name: "[ATM-100] matched in-sync", Status: "Queued"}, // -> UPDATE (in-sync)
-		{ID: "t2", Name: "[ATM-101] matched drifted", Status: "Queued"}, // -> UPDATE (drift: want "In progress")
-		{ID: "t3", Name: "[ATM-999] keyed orphan", Status: "Queued"},    // -> INVESTIGATE
-		{ID: "t4", Name: "[ATM-DERIVED-042] derived", Status: "Queued"}, // -> UNKEYED
-		{ID: "t5", Name: "free-form no key", Status: "Queued"},          // -> UNKEYED
+		// Post-grouping: local "Queued" groups to column "to do", so an in-sync
+		// remote task carries the COLUMN "to do" AND the exact status:<word> label.
+		{ID: "t1", Name: "[ATM-100] matched in-sync", Status: "to do", Tags: []string{"status:queued"}}, // -> UPDATE (in-sync)
+		{ID: "t2", Name: "[ATM-101] matched drifted", Status: "to do"}, // -> UPDATE (drift: In progress->want "in progress")
+		{ID: "t3", Name: "[ATM-999] keyed orphan", Status: "to do"},    // -> INVESTIGATE
+		{ID: "t4", Name: "[ATM-DERIVED-042] derived", Status: "to do"}, // -> UNKEYED
+		{ID: "t5", Name: "free-form no key", Status: "to do"},          // -> UNKEYED
 	}
 
 	plan := PlanReconcile(local, remote)
@@ -52,11 +54,12 @@ func TestPlanReconcileBuckets(t *testing.T) {
 	for _, e := range plan.Update {
 		byKey[e.Key] = e
 	}
-	if byKey["ATM-100"].Detail != "status in-sync" {
-		t.Errorf("ATM-100 detail = %q, want in-sync", byKey["ATM-100"].Detail)
+	// Keyed off the TYPED InSync flag (N3 — never the human Detail string).
+	if !byKey["ATM-100"].InSync {
+		t.Errorf("ATM-100 must be InSync (column to do + label status:queued), detail=%q", byKey["ATM-100"].Detail)
 	}
-	if byKey["ATM-101"].Detail == "status in-sync" {
-		t.Errorf("ATM-101 must be flagged status-drift, got %q", byKey["ATM-101"].Detail)
+	if byKey["ATM-101"].InSync {
+		t.Errorf("ATM-101 must NOT be InSync (column+label drift), detail=%q", byKey["ATM-101"].Detail)
 	}
 }
 

@@ -44,6 +44,18 @@ type Client interface {
 	UpdateTask(ctx context.Context, t Task) error
 	// SetCustomField sets one custom-field value (the two-call write, P0 §1.5).
 	SetCustomField(ctx context.Context, taskID, fieldID, value string) error
+	// AddTag attaches a tag (label) to a task via ClickUp's dedicated add-tag
+	// endpoint (POST /task/{id}/tag/{name}). This is the RELIABLE way to set a
+	// tag on an EXISTING task — ClickUp's update-task body IGNORES the `tags`
+	// field (verified live 2026-07-27: a status column update landed but the
+	// body-supplied tags did not), so the `status:<word>` label MUST go through
+	// this endpoint on the update path. Adding an already-present tag is a no-op.
+	AddTag(ctx context.Context, taskID, tag string) error
+	// RemoveTag detaches a tag from a task (DELETE /task/{id}/tag/{name}). Used
+	// only to remove a SUPERSEDED status:<word> label when the exact status
+	// changed within the same grouped column. It NEVER removes a non-status tag
+	// and never deletes the task itself (§9/§11.4.122).
+	RemoveTag(ctx context.Context, taskID, tag string) error
 	// DeleteTask deletes a task. Only ever called under AllowRemoteDelete.
 	DeleteTask(ctx context.Context, taskID string) error
 }
@@ -72,4 +84,6 @@ func (stubClient) UpdateTask(context.Context, Task) error { return ErrNotImpleme
 func (stubClient) SetCustomField(context.Context, string, string, string) error {
 	return ErrNotImplemented
 }
-func (stubClient) DeleteTask(context.Context, string) error { return ErrNotImplemented }
+func (stubClient) AddTag(context.Context, string, string) error    { return ErrNotImplemented }
+func (stubClient) RemoveTag(context.Context, string, string) error { return ErrNotImplemented }
+func (stubClient) DeleteTask(context.Context, string) error        { return ErrNotImplemented }

@@ -55,38 +55,52 @@ type titlePrefixMapper struct{}
 func New() Mapper { return titlePrefixMapper{} }
 
 // ToRemote builds the ClickUp-facing task for a push (create or update). The
-// key is embedded as the title prefix (the board convention); Status is mapped
-// through the §3 vocab; Type becomes a ClickUp tag.
+// key is embedded as the title prefix (the board convention). Status is GROUPED
+// into an existing board COLUMN (StatusColumn — the fix for the prior 400
+// "Status does not exist"), while the EXACT lifecycle state is preserved
+// additively as a `status:<word>` LABEL tag (StatusLabel) so it stays visible +
+// trackable after grouping (operator rule 2026-07-27). Type also becomes a tag.
 func (titlePrefixMapper) ToRemote(it LocalItem) (RemoteTask, error) {
 	if it.Key == "" {
 		return RemoteTask{}, ErrMissingKey
 	}
-	status, ok := StatusToRemote(it.Status)
+	column, ok := StatusColumn(it.Status)
 	if !ok {
 		return RemoteTask{}, ErrUnmappedStatus
 	}
 	rt := RemoteTask{
 		Name:        TitleWithKey(it.Key, cleanTitle(it.Key, it.Title)),
 		Description: it.Description,
-		Status:      status,
+		Status:      column,
 	}
+	var tags []string
 	if t := strings.TrimSpace(it.Type); t != "" {
-		rt.Tags = []string{t}
+		tags = append(tags, t) // Type label (Bug/Feature/Task)
 	}
+	if lbl, okLbl := StatusLabel(it.Status); okLbl {
+		tags = append(tags, lbl) // exact-status label: status:<word>
+	}
+	rt.Tags = tags
 	return rt, nil
 }
 
-// ToLocal recovers the key + status from a pulled remote task. It fills only
-// the fields this mode round-trips; unmapped remote statuses surface as an
-// error (never a guessed local value, §11.4.6 / P2 §3 DZ-9).
+// ToLocal recovers the key + status from a pulled remote task. The EXACT state
+// is read from the `status:<word>` LABEL first (lossless, StatusFromLabel);
+// only when a task carries no status label does it fall back to the grouped
+// COLUMN, which is a lossy representative (ColumnToLocalRepresentative). An
+// unmapped remote surfaces as an error (never a guessed local value, §11.4.6 /
+// P2 §3 DZ-9).
 func (titlePrefixMapper) ToLocal(rt RemoteTask) (LocalItem, error) {
 	key, ok := ParseKey(rt.Name)
 	if !ok {
 		return LocalItem{}, ErrNoKeyInTitle
 	}
-	status, ok := StatusToLocal(rt.Status)
+	status, ok := StatusFromLabel(rt.Tags)
 	if !ok {
-		return LocalItem{}, ErrUnmappedStatus
+		status, ok = ColumnToLocalRepresentative(rt.Status)
+		if !ok {
+			return LocalItem{}, ErrUnmappedStatus
+		}
 	}
 	return LocalItem{
 		Key:         key,

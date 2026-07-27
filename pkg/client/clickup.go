@@ -104,6 +104,21 @@ func (c *clickupClient) SetCustomField(context.Context, string, string, string) 
 	return ErrNotImplemented
 }
 
+// AddTag attaches a label to an existing task via ClickUp's dedicated add-tag
+// endpoint (the update-task body ignores tags — verified live 2026-07-27). Only
+// ever reached under --apply.
+func (c *clickupClient) AddTag(ctx context.Context, taskID, tag string) error {
+	_, err := c.up.Tags.AddTagToTask(ctx, taskID, tag, nil)
+	return err
+}
+
+// RemoveTag detaches a (superseded status:<word>) label from a task. Only ever
+// reached under --apply; never deletes the task (§9/§11.4.122).
+func (c *clickupClient) RemoveTag(ctx context.Context, taskID, tag string) error {
+	_, err := c.up.Tags.RemoveTagToTask(ctx, taskID, tag, nil)
+	return err
+}
+
 // DeleteTask is never called under the never-auto-delete-remote default
 // (§9/§11.4.122); it returns an explicit error to keep the engine honest.
 func (c *clickupClient) DeleteTask(context.Context, string) error {

@@ -110,6 +110,14 @@ func (titlePrefixMapper) ToLocal(rt RemoteTask) (LocalItem, error) {
 	}, nil
 }
 
+// RemoteTitle is the exact ClickUp task name this mapper would push for the
+// item (`[KEY] <title-without-duplicate-prefix>`). PlanReconcile compares it
+// with the live remote name to detect TITLE drift (ATM-1123); it is pure and
+// independent of the status vocabulary.
+func RemoteTitle(it LocalItem) string {
+	return TitleWithKey(it.Key, cleanTitle(it.Key, it.Title))
+}
+
 // cleanTitle strips a leading `[KEY] ` prefix from a title so the stored title
 // is prefix-free (the prefix is re-applied by TitleWithKey on push).
 func cleanTitle(key, title string) string {

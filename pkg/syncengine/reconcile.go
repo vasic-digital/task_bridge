@@ -54,6 +54,11 @@ type PlanEntry struct {
 	// string coupling). Only ever set on UPDATE rows; false (and omitted) for
 	// every other bucket.
 	InSync bool `json:"in_sync,omitempty"`
+	// TitleDrift is true on an UPDATE row when the remote task name differs from
+	// the name the mapper would push for the local item (mapper.RemoteTitle).
+	// A title-only drift is repaired with a NAME-ONLY update (no description,
+	// status or tag overwrite). ATM-1123.
+	TitleDrift bool `json:"title_drift,omitempty"`
 	// RemoteTags is the matched remote task's current tag set (UPDATE rows only).
 	// Apply uses it to reconcile the status:<word> label without an extra GET:
 	// add the wanted label if absent, remove a SUPERSEDED status label if present.
@@ -164,10 +169,14 @@ func PlanReconcile(local []mapper.LocalItem, remote []client.Task) Plan {
 		colMatch := mapper.RemoteStatusMatchesLocal(t.Status, li.Status)
 		wantLbl, hasLbl := mapper.StatusLabel(li.Status)
 		lblMatch := !hasLbl || remoteHasTag(t.Tags, wantLbl)
+		wantTitle := mapper.RemoteTitle(li)
+		e.TitleDrift = strings.TrimSpace(t.Name) != strings.TrimSpace(wantTitle)
 		switch {
-		case colMatch && lblMatch:
+		case colMatch && lblMatch && !e.TitleDrift:
 			e.InSync = true
 			e.Detail = "status in-sync (column + label)"
+		case colMatch && lblMatch && e.TitleDrift:
+			e.Detail = fmt.Sprintf("title-drift: remote=%q want=%q", t.Name, wantTitle)
 		case !colMatch:
 			if want, okm := mapper.StatusColumn(li.Status); okm {
 				e.Detail = fmt.Sprintf("status-drift: remote=%q want-column=%q label=%q", t.Status, want, wantLbl)
@@ -176,6 +185,9 @@ func PlanReconcile(local []mapper.LocalItem, remote []client.Task) Plan {
 			}
 		default: // column matches but the status label is missing/stale
 			e.Detail = fmt.Sprintf("label-drift: column ok, missing status label %q", wantLbl)
+		}
+		if e.TitleDrift && !e.InSync && !(colMatch && lblMatch) {
+			e.Detail += "; title-drift"
 		}
 		plan.Update = append(plan.Update, e)
 	}
@@ -225,92 +237,214 @@ type ApplyResult struct {
 	Created int
 	Updated int
 	Errors  []string
+	// CreatedIDs / UpdatedIDs map item key -> ClickUp task id for every write
+	// that succeeded (the audit trail of a bounded batch, ATM-1123).
+	CreatedIDs map[string]string
+	UpdatedIDs map[string]string
+	// Attempted is the number of actionable items processed in this call;
+	// Remaining the number that were left for a later batch (Limit / StopOnError).
+	Attempted int
+	Remaining int
+	// Stopped is true when StopOnError halted the batch on the first failing item.
+	Stopped bool
 }
 
-// Apply performs the GATED push. It is reached ONLY under an explicit apply
-// request (never in a dry-run). It creates missing tasks and updates
-// status-drifted tasks. It NEVER touches INVESTIGATE / UNKEYED / DELETE rows —
-// those are operator decisions and no remote data is ever destroyed
-// (§9/§11.4.122). listID is where new tasks are created.
+// ApplyOptions bounds a gated push. The zero value reproduces the original
+// Apply behaviour (unbounded, collect-and-continue, legacy order).
+type ApplyOptions struct {
+	// Limit caps the number of ACTIONABLE items (CREATE + drifted UPDATE) touched
+	// in one call; 0 = unlimited. The rest stay in Remaining for the next batch.
+	Limit int
+	// StopOnError halts the batch after the first item that produced an error.
+	StopOnError bool
+	// NewestFirst orders actionable items by descending numeric key suffix
+	// (ATM-1325 before ATM-1244) so a bounded batch handles the newest first.
+	NewestFirst bool
+	// OnEvent, when set, is called once per item with its outcome (audit log).
+	OnEvent func(ApplyEvent)
+}
+
+// ApplyEvent is one per-item outcome, handed to ApplyOptions.OnEvent. It never
+// carries credentials.
+type ApplyEvent struct {
+	Op     string `json:"op"` // CREATE | UPDATE
+	Key    string `json:"key"`
+	TaskID string `json:"task_id,omitempty"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
+	Err    string `json:"err,omitempty"`
+}
+
+// Apply performs the GATED push with the original unbounded semantics. See
+// ApplyWith for the bounded variant.
 func Apply(ctx context.Context, cl client.Client, mp mapper.Mapper, listID string, plan Plan, local []mapper.LocalItem) (ApplyResult, error) {
-	byKey := indexLocal(local)
-	var res ApplyResult
+	return ApplyWith(ctx, cl, mp, listID, plan, local, ApplyOptions{})
+}
 
-	for _, e := range plan.Create {
-		li, ok := byKey[e.Key]
-		if !ok {
-			res.Errors = append(res.Errors, fmt.Sprintf("CREATE %s: local item vanished", e.Key))
-			continue
-		}
-		rt, err := mp.ToRemote(li)
-		if err != nil {
-			res.Errors = append(res.Errors, fmt.Sprintf("CREATE %s: map: %v", e.Key, err))
-			continue
-		}
-		if _, err := cl.CreateTask(ctx, listID, client.Task{
-			Name: rt.Name, Description: rt.Description, Status: rt.Status, Tags: rt.Tags,
-		}); err != nil {
-			res.Errors = append(res.Errors, fmt.Sprintf("CREATE %s: %v", e.Key, err))
-			continue
-		}
-		res.Created++
+type applyWork struct {
+	kind  ActionKind
+	entry PlanEntry
+}
+
+// keyNum returns the numeric suffix of a PREFIX-NNN key (0 when absent).
+func keyNum(key string) int {
+	i := strings.LastIndex(key, "-")
+	if i < 0 {
+		return 0
 	}
+	n := 0
+	for _, r := range key[i+1:] {
+		if r < '0' || r > '9' {
+			return 0
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
 
+// ApplyWith performs the GATED push. It is reached ONLY under an explicit apply
+// request (never in a dry-run). It creates missing tasks and updates drifted
+// tasks (status column, status label, title). It NEVER touches INVESTIGATE /
+// UNKEYED / DELETE rows — those are operator decisions and no remote data is
+// ever destroyed (§9/§11.4.122). listID is where new tasks are created. opts
+// bounds the batch (Limit / StopOnError / NewestFirst) and exposes an audit hook.
+func ApplyWith(ctx context.Context, cl client.Client, mp mapper.Mapper, listID string, plan Plan, local []mapper.LocalItem, opts ApplyOptions) (ApplyResult, error) {
+	byKey := indexLocal(local)
+	res := ApplyResult{CreatedIDs: map[string]string{}, UpdatedIDs: map[string]string{}}
+
+	var work []applyWork
+	for _, e := range plan.Create {
+		work = append(work, applyWork{ActionCreate, e})
+	}
 	for _, e := range plan.Update {
-		// Skip only when BOTH the grouped column AND the status label already
-		// match (InSync). Keyed off the TYPED InSync flag, never the human-
-		// readable Detail string (N3).
+		// Skip only when status column, status label AND title already match
+		// (InSync). Keyed off the TYPED InSync flag, never the human-readable
+		// Detail string (N3).
 		if e.InSync {
 			continue
 		}
+		work = append(work, applyWork{ActionUpdate, e})
+	}
+	if opts.NewestFirst {
+		sort.SliceStable(work, func(i, j int) bool {
+			ni, nj := keyNum(work[i].entry.Key), keyNum(work[j].entry.Key)
+			if ni != nj {
+				return ni > nj
+			}
+			return work[i].entry.Key > work[j].entry.Key
+		})
+	}
+	total := len(work)
+
+	emit := func(ev ApplyEvent) {
+		if opts.OnEvent != nil {
+			opts.OnEvent(ev)
+		}
+	}
+
+	for idx, w := range work {
+		if opts.Limit > 0 && res.Attempted >= opts.Limit {
+			break
+		}
+		res.Attempted++
+		e := w.entry
 		li, ok := byKey[e.Key]
-		if !ok {
-			continue
-		}
-		rt, err := mp.ToRemote(li)
-		if err != nil {
-			res.Errors = append(res.Errors, fmt.Sprintf("UPDATE %s: map: %v", e.Key, err))
-			continue
-		}
-		touched := false
-		// (1) column: push only when the grouped column drifted (the update body
-		// DOES honour `status`, verified live 2026-07-27).
-		if !mapper.RemoteStatusMatchesLocal(e.RemoteStatus, li.Status) {
-			if err := cl.UpdateTask(ctx, client.Task{
-				ID: e.TaskID, Name: rt.Name, Description: rt.Description, Status: rt.Status, Tags: rt.Tags,
-			}); err != nil {
-				res.Errors = append(res.Errors, fmt.Sprintf("UPDATE %s: %v", e.Key, err))
-				continue
+		var errs []string
+		switch w.kind {
+		case ActionCreate:
+			if !ok {
+				errs = append(errs, fmt.Sprintf("CREATE %s: local item vanished", e.Key))
+				break
 			}
-			touched = true
-		}
-		// (2) status label: ClickUp's update body IGNORES tags (verified live
-		// 2026-07-27), so the exact status:<word> label MUST be reconciled through
-		// the dedicated add/remove-tag endpoints. Remove any SUPERSEDED status
-		// label, then add the wanted one if absent. Type/other tags are never
-		// touched (mapper.IsStatusLabel gates removal).
-		if wantLbl, hasLbl := mapper.StatusLabel(li.Status); hasLbl {
-			for _, tg := range e.RemoteTags {
-				if mapper.IsStatusLabel(tg) && !strings.EqualFold(strings.TrimSpace(tg), wantLbl) {
-					if err := cl.RemoveTag(ctx, e.TaskID, tg); err != nil {
-						res.Errors = append(res.Errors, fmt.Sprintf("UPDATE %s: remove stale label %q: %v", e.Key, tg, err))
-						continue
-					}
-					touched = true
+			rt, err := mp.ToRemote(li)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("CREATE %s: map: %v", e.Key, err))
+				break
+			}
+			created, err := cl.CreateTask(ctx, listID, client.Task{
+				Name: rt.Name, Description: rt.Description, Status: rt.Status, Tags: rt.Tags,
+			})
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("CREATE %s: %v", e.Key, err))
+				break
+			}
+			res.Created++
+			res.CreatedIDs[e.Key] = created.ID
+			emit(ApplyEvent{Op: "CREATE", Key: e.Key, TaskID: created.ID, OK: true, Detail: "status=" + rt.Status})
+		case ActionUpdate:
+			if !ok {
+				break
+			}
+			rt, err := mp.ToRemote(li)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("UPDATE %s: map: %v", e.Key, err))
+				break
+			}
+			touched := false
+			colDrift := !mapper.RemoteStatusMatchesLocal(e.RemoteStatus, li.Status)
+			// (1) column: push only when the grouped column drifted (the update
+			// body DOES honour `status`, verified live 2026-07-27). This full
+			// update also carries the corrected name.
+			if colDrift {
+				if err := cl.UpdateTask(ctx, client.Task{
+					ID: e.TaskID, Name: rt.Name, Description: rt.Description, Status: rt.Status, Tags: rt.Tags,
+				}); err != nil {
+					errs = append(errs, fmt.Sprintf("UPDATE %s: %v", e.Key, err))
+					break
 				}
-			}
-			if !remoteHasTag(e.RemoteTags, wantLbl) {
-				if err := cl.AddTag(ctx, e.TaskID, wantLbl); err != nil {
-					res.Errors = append(res.Errors, fmt.Sprintf("UPDATE %s: add label %q: %v", e.Key, wantLbl, err))
-					continue
+				touched = true
+			} else if e.TitleDrift {
+				// (1b) title-only drift: NAME-ONLY update (empty description /
+				// status / tags are omitted from the request body).
+				if err := cl.UpdateTask(ctx, client.Task{ID: e.TaskID, Name: mapper.RemoteTitle(li)}); err != nil {
+					errs = append(errs, fmt.Sprintf("UPDATE %s: title: %v", e.Key, err))
+					break
 				}
 				touched = true
 			}
+			// (2) status label: ClickUp's update body IGNORES tags (verified live
+			// 2026-07-27), so the exact status:<word> label MUST be reconciled
+			// through the dedicated add/remove-tag endpoints. Remove any
+			// SUPERSEDED status label, then add the wanted one if absent.
+			// Type/other tags are never touched (mapper.IsStatusLabel gates
+			// removal).
+			if wantLbl, hasLbl := mapper.StatusLabel(li.Status); hasLbl {
+				failed := false
+				for _, tg := range e.RemoteTags {
+					if mapper.IsStatusLabel(tg) && !strings.EqualFold(strings.TrimSpace(tg), wantLbl) {
+						if err := cl.RemoveTag(ctx, e.TaskID, tg); err != nil {
+							errs = append(errs, fmt.Sprintf("UPDATE %s: remove stale label %q: %v", e.Key, tg, err))
+							failed = true
+							continue
+						}
+						touched = true
+					}
+				}
+				if !failed && !remoteHasTag(e.RemoteTags, wantLbl) {
+					if err := cl.AddTag(ctx, e.TaskID, wantLbl); err != nil {
+						errs = append(errs, fmt.Sprintf("UPDATE %s: add label %q: %v", e.Key, wantLbl, err))
+					} else {
+						touched = true
+					}
+				}
+			}
+			if touched {
+				res.Updated++
+				res.UpdatedIDs[e.Key] = e.TaskID
+				emit(ApplyEvent{Op: "UPDATE", Key: e.Key, TaskID: e.TaskID, OK: len(errs) == 0, Detail: e.Detail})
+			}
 		}
-		if touched {
-			res.Updated++
+		for _, m := range errs {
+			res.Errors = append(res.Errors, m)
+			emit(ApplyEvent{Op: string(w.kind), Key: e.Key, TaskID: e.TaskID, OK: false, Err: m})
+		}
+		if len(errs) > 0 && opts.StopOnError {
+			res.Stopped = true
+			res.Remaining = total - (idx + 1)
+			return res, nil
 		}
 	}
+	res.Remaining = total - res.Attempted
 	return res, nil
 }
 

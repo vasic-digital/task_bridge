@@ -12,10 +12,31 @@ package client
 
 import (
 	"context"
+	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
+	"time"
 
 	clickup "github.com/raksul/go-clickup/clickup"
 )
+
+// DefaultMinInterval spaces live requests so a sustained batch stays under
+// ClickUp's ~100 requests/minute per-token limit (ATM-1123).
+const DefaultMinInterval = 700 * time.Millisecond
+
+// DefaultMax429Retries is how many times one request is retried after HTTP 429.
+const DefaultMax429Retries = 5
+
+// Options tunes the live transport. The zero value means: production base URL,
+// DefaultMinInterval pacing, DefaultMax429Retries, real clock.
+type Options struct {
+	BaseURL       string // override (tests / proxies); must be http(s); trailing slash added
+	MinInterval   time.Duration
+	Max429Retries int
+	Sleep         func(time.Duration)
+	Now           func() time.Time
+}
 
 // clickPageSize is ClickUp's fixed v2 page size for list/{id}/task. A page that
 // returns exactly this many tasks means "there may be more" (the library does
@@ -33,7 +54,34 @@ type clickupClient struct {
 // The token is handed straight to the transport and never retained or logged
 // here (§11.4.10). Returns the Client interface so callers stay transport-blind.
 func NewClickUp(token string) Client {
-	return &clickupClient{up: clickup.NewClient(nil, token)}
+	return NewClickUpWithOptions(token, Options{})
+}
+
+// NewClickUpWithOptions is NewClickUp with an explicit transport policy. Every
+// request goes through the throttling/429-aware RoundTripper (throttle.go).
+func NewClickUpWithOptions(token string, o Options) Client {
+	if o.MinInterval == 0 {
+		o.MinInterval = DefaultMinInterval
+	}
+	if o.Max429Retries == 0 {
+		o.Max429Retries = DefaultMax429Retries
+	}
+	hc := &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: newThrottle(nil, ThrottleConfig{
+			MinInterval: o.MinInterval, Max429Retries: o.Max429Retries, Sleep: o.Sleep, Now: o.Now,
+		}),
+	}
+	up := clickup.NewClient(hc, token)
+	if o.BaseURL != "" {
+		if u, err := url.Parse(o.BaseURL); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+			if !strings.HasSuffix(u.Path, "/") {
+				u.Path += "/"
+			}
+			up.BaseURL = u
+		}
+	}
+	return &clickupClient{up: up}
 }
 
 // ListTasks returns one page of tasks for the list. sinceMS>0 restricts to

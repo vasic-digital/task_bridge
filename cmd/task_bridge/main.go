@@ -34,7 +34,7 @@ usage: task_bridge <command> [flags]
 
 commands:
   reconcile   DIFF the local items DB against the live board (dry-run default)
-  push        push local items to the remote board                    [stub]
+  push        (placeholder; use "reconcile --apply" for the real push)  [stub]
   pull        pull remote tasks into the local SSoT                   [stub]
   resolve     resolve folder/board URLs to IDs (live API probe)       [stub]
   status      print sync state                                        [stub]
@@ -52,7 +52,17 @@ reconcile flags:
                  local items DB — without it every board receives a copy of
                  EVERY item regardless of context (multi-board fan-out must be
                  scoped per consumer, never assumed by this generic engine).
-  --apply        GATED real push (create + status-update). Default: dry-run.
+  --apply        GATED real push (create + status/label/title update; never
+                 delete). Default: dry-run. This is the REAL push path; the
+                 separate "push" subcommand below is a placeholder only.
+  --limit <n>    with --apply: touch at most n actionable items (CREATE +
+                 drifted UPDATE) this run; the rest stay for the next batch.
+  --newest-first with --apply: order actionable items by descending key number.
+  --stop-on-error with --apply: halt after the first failing item (exit 1).
+  --apply-log <path>  with --apply: append one JSON line per item outcome
+                 (op, key, task_id, ok, err) — never contains credentials.
+  --min-interval-ms <n>  minimum spacing between ClickUp requests (default 700;
+                 HTTP 429 is retried honouring Retry-After).
 
 env (injected by the consumer; token value is never printed):
   CLICKUP_API_KEY    personal token (required)
@@ -95,6 +105,11 @@ func runReconcile(args []string) int {
 	outPath := fs.String("out", "", "write the JSON diff artifact here")
 	prefixCSV := fs.String("prefix", os.Getenv("TASK_BRIDGE_PREFIX"), "comma-separated key-prefix filter (e.g. ATM or MVR,SPK); empty = no filtering")
 	apply := fs.Bool("apply", false, "GATED real push (default: dry-run)")
+	limit := fs.Int("limit", 0, "with --apply: max actionable items this run (0 = unlimited)")
+	newestFirst := fs.Bool("newest-first", false, "with --apply: order by descending key number")
+	stopOnErr := fs.Bool("stop-on-error", false, "with --apply: halt after the first failing item")
+	applyLog := fs.String("apply-log", "", "with --apply: append per-item JSONL outcomes here")
+	minIntervalMS := fs.Int("min-interval-ms", int(client.DefaultMinInterval/time.Millisecond), "minimum ms between ClickUp requests")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -126,7 +141,10 @@ func runReconcile(args []string) int {
 	if *prefixCSV != "" {
 		fmt.Printf("prefix filter %q: %d of %d local items in scope for this list\n", *prefixCSV, len(local), allLocalCount)
 	}
-	cl := client.NewClickUp(token)
+	cl := client.NewClickUpWithOptions(token, client.Options{
+		BaseURL:     os.Getenv("TASK_BRIDGE_BASE_URL"), // tests/proxies only; empty = production
+		MinInterval: time.Duration(*minIntervalMS) * time.Millisecond,
+	})
 	remote, err := syncengine.FetchAllRemote(ctx, cl, *listID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "reconcile: fetch remote tasks: %v\n", err)
@@ -146,12 +164,32 @@ func runReconcile(args []string) int {
 
 	if *apply {
 		fmt.Println("\n--apply: performing GATED push (create + status-update; never delete)…")
-		res, err := syncengine.Apply(ctx, cl, mapper.New(), *listID, plan, local)
+		opts := syncengine.ApplyOptions{Limit: *limit, StopOnError: *stopOnErr, NewestFirst: *newestFirst}
+		var logf *os.File
+		if *applyLog != "" {
+			f, err := os.OpenFile(*applyLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "reconcile: open apply-log: %v\n", err)
+				return 1
+			}
+			defer f.Close()
+			logf = f
+			opts.OnEvent = func(ev syncengine.ApplyEvent) {
+				b, _ := json.Marshal(struct {
+					TS     string `json:"ts"`
+					ListID string `json:"list_id"`
+					syncengine.ApplyEvent
+				}{time.Now().UTC().Format(time.RFC3339), *listID, ev})
+				_, _ = logf.Write(append(b, '\n'))
+			}
+		}
+		res, err := syncengine.ApplyWith(ctx, cl, mapper.New(), *listID, plan, local, opts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "reconcile: apply: %v\n", err)
 			return 1
 		}
-		fmt.Printf("apply: created=%d updated=%d errors=%d\n", res.Created, res.Updated, len(res.Errors))
+		fmt.Printf("apply: created=%d updated=%d errors=%d attempted=%d remaining=%d stopped=%v\n",
+			res.Created, res.Updated, len(res.Errors), res.Attempted, res.Remaining, res.Stopped)
 		for _, e := range res.Errors {
 			fmt.Fprintf(os.Stderr, "  apply-error: %s\n", e)
 		}

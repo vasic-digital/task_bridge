@@ -27,6 +27,10 @@ type LocalItem struct {
 	CreatedBy    string   // canonical handle
 	AssignedTo   string   // canonical handle
 	LastModified string   // local last_modified (compared, not pushed)
+	// States holds the RAW text of the consumer-defined extra columns (see
+	// pkg/states) by column name. Nil when the feature is off or the DB has none
+	// of the columns. The engine normalises and validates it; the mapper does not.
+	States map[string]string
 }
 
 // Mapper converts both directions.

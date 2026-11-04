@@ -1,0 +1,136 @@
+{
+  "update": [
+    {
+      "kind": "UPDATE",
+      "key": "ATM-1",
+      "task_id": "r-ATM-1",
+      "local_status": "Queued",
+      "remote_status": "to do",
+      "remote_name": "[ATM-1] title ATM-1",
+      "remote_tags": [
+        "bug",
+        "status:queued"
+      ],
+      "detail": "state-drift: reproduction_state[BLOCK]: \"UNSET\" -\u003e \"reproduced-live\"; reproduction_red_cmd[BLOCK]: \"\" -\u003e \"bash r.sh\\nsecond\"; block:ADD",
+      "state_diff": {
+        "changes": [
+          {
+            "key": "reproduction_state",
+            "carrier": "BLOCK",
+            "op": "SET",
+            "have": "UNSET",
+            "want": "reproduced-live"
+          },
+          {
+            "key": "reproduction_red_cmd",
+            "carrier": "BLOCK",
+            "op": "SET",
+            "have": "",
+            "want": "bash r.sh\nsecond"
+          }
+        ],
+        "block_op": "ADD",
+        "block_keys": [
+          "reproduction_state",
+          "investigation_state",
+          "reproduction_evidence",
+          "reproduction_red_cmd",
+          "reproduction_green_cmd",
+          "reproduction_env",
+          "investigation_root_cause",
+          "investigation_evidence"
+        ]
+      },
+      "state_drift": true
+    },
+    {
+      "kind": "UPDATE",
+      "key": "ATM-2",
+      "task_id": "r-ATM-2",
+      "local_status": "In progress",
+      "remote_status": "in progress",
+      "remote_name": "[ATM-2] title ATM-2",
+      "in_sync": true,
+      "remote_tags": [
+        "bug",
+        "status:in progress"
+      ],
+      "detail": "status in-sync (column + label); state-refused: REFUSED:STATE_INVALID:investigation_state",
+      "state_diff": {
+        "refusals": [
+          "STATE_INVALID:investigation_state"
+        ]
+      }
+    },
+    {
+      "kind": "UPDATE",
+      "key": "ATM-3",
+      "task_id": "r-ATM-3",
+      "local_status": "Queued",
+      "remote_status": "to do",
+      "remote_name": "[ATM-3] title ATM-3",
+      "remote_tags": [
+        "bug",
+        "status:queued"
+      ],
+      "detail": "state-drift: reproduction_state[BLOCK]: \"UNSET\" -\u003e \"blocked-no-device\"; block:ADD",
+      "state_diff": {
+        "changes": [
+          {
+            "key": "reproduction_state",
+            "carrier": "BLOCK",
+            "op": "SET",
+            "have": "UNSET",
+            "want": "blocked-no-device"
+          }
+        ],
+        "block_op": "ADD",
+        "block_keys": [
+          "reproduction_state",
+          "investigation_state",
+          "reproduction_evidence",
+          "reproduction_red_cmd",
+          "reproduction_green_cmd",
+          "reproduction_env",
+          "investigation_root_cause",
+          "investigation_evidence"
+        ]
+      },
+      "state_drift": true
+    }
+  ],
+  "create": [
+    {
+      "kind": "CREATE",
+      "key": "ATM-5",
+      "local_status": "Queued",
+      "detail": "local item with no remote task — push would create; state: investigation_state[BLOCK]: \"UNSET\" -\u003e \"in-progress\"; block:ADD",
+      "state_diff": {
+        "changes": [
+          {
+            "key": "investigation_state",
+            "carrier": "BLOCK",
+            "op": "SET",
+            "have": "UNSET",
+            "want": "in-progress"
+          }
+        ],
+        "block_op": "ADD",
+        "block_keys": [
+          "reproduction_state",
+          "investigation_state",
+          "reproduction_evidence",
+          "reproduction_red_cmd",
+          "reproduction_green_cmd",
+          "reproduction_env",
+          "investigation_root_cause",
+          "investigation_evidence"
+        ]
+      },
+      "state_drift": true
+    }
+  ],
+  "investigate": null,
+  "delete": null,
+  "unkeyed": null
+}

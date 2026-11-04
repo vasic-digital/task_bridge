@@ -22,6 +22,18 @@ never expires). The token is injected by the consumer and never logged.
 | Delete | `DELETE /task/{task_id}` | `UNCONFIRMED:` verify P1; only under AllowRemoteDelete |
 | Set custom field | `POST /task/{task_id}/field/{field_id}` | `UNCONFIRMED:` verify via go-clickup `custom_fields.go` (P1) |
 
+## Custom fields and descriptions (state-field sync, `docs/STATES_SYNC.md`)
+
+| Op | Method + path | Notes |
+|---|---|---|
+| List fields | `GET /list/{list_id}/field` | name, type, `type_config.options[{id,name,orderindex}]` of a drop-down |
+| Set value | `POST /task/{task_id}/field/{field_id}` body `{"value": v}` | drop-down: option id; text: string |
+| Clear value | `DELETE /task/{task_id}/field/{field_id}` | removes the value only |
+| Create field | `POST /list/{list_id}/field` | `UNCONFIRMED:` the public documentation lists no such endpoint; 404/405/501 is handled as "unsupported" |
+| Description write | `PUT /task/{task_id}` body `{"markdown_description": md}` | name, status and tags are not sent |
+| Markdown source on read | `GET /list/{id}/task?include_markdown_description=true`, `GET /task/{id}?include_markdown_description=true` | `UNCONFIRMED:` live behaviour; without it only a rendered plain `description` is returned and the block is never rewritten |
+| Last page | `last_page` member of the list response | `UNCONFIRMED:` used when present, else the full-page rule |
+
 ## Folders / Lists
 
 | Op | Method + path | Notes |

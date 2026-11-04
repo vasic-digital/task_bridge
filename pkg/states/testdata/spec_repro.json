@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "block_id": "TB-STATES",
+  "fields": [
+    {
+      "key": "reproduction_state",
+      "kind": "enum",
+      "label": "Reproduction state",
+      "values": ["UNSET", "UNREPRODUCED", "reproduced-live", "reproduced-host-fixture", "not-reproducible-with-evidence", "blocked-no-device"],
+      "unset": "UNSET"
+    },
+    {
+      "key": "investigation_state",
+      "kind": "enum",
+      "label": "Investigation state",
+      "values": ["UNSET", "not-started", "in-progress", "root-cause-found-with-evidence", "root-cause-unconfirmed", "closed-no-defect"],
+      "unset": "UNSET"
+    },
+    {"key": "reproduction_evidence", "kind": "text", "label": "Reproduction evidence", "max_runes": 4000},
+    {"key": "reproduction_red_cmd", "kind": "text", "label": "Reproduction RED command", "max_runes": 2000},
+    {"key": "reproduction_green_cmd", "kind": "text", "label": "Reproduction GREEN command", "max_runes": 2000},
+    {"key": "reproduction_env", "kind": "text", "label": "Reproduction environment", "max_runes": 1000},
+    {"key": "investigation_root_cause", "kind": "text", "label": "Investigation root cause", "max_runes": 4000},
+    {"key": "investigation_evidence", "kind": "text", "label": "Investigation evidence", "max_runes": 4000}
+  ]
+}

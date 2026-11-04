@@ -25,6 +25,7 @@ import (
 	"github.com/vasic-digital/task_bridge/pkg/client"
 	"github.com/vasic-digital/task_bridge/pkg/localstore"
 	"github.com/vasic-digital/task_bridge/pkg/mapper"
+	"github.com/vasic-digital/task_bridge/pkg/states"
 	"github.com/vasic-digital/task_bridge/pkg/syncengine"
 )
 
@@ -63,6 +64,29 @@ reconcile flags:
                  (op, key, task_id, ok, err) — never contains credentials.
   --min-interval-ms <n>  minimum spacing between ClickUp requests (default 700;
                  HTTP 429 is retried honouring Retry-After).
+
+state-field flags (the consumer-defined tracker states; off unless --states-spec):
+  --states-spec <path>  JSON spec of the state fields (keys, closed vocabularies);
+                 or env TASK_BRIDGE_STATES_SPEC. The values are read from the
+                 same-named columns of the items table.
+  --carrier <m>  auto (default: a custom field where the list has one, else a
+                 managed description block) | block | field (fail closed if any
+                 field is missing). Or env TASK_BRIDGE_STATES_CARRIER.
+  --create-missing-fields  with --apply: try to create the missing custom fields
+                 (guarded, capped, listed; falls back to the block when the remote
+                 offers no such endpoint). Or env TASK_BRIDGE_CREATE_FIELDS=1.
+  --max-field-creates <n>  cap on creations per list (default: the spec size).
+  --states-only  with --apply: write ONLY state fields of existing tasks (no
+                 create, no status/title/label update) - the staged roll-out switch.
+  --states-strict  exit 2 when a spec column is absent from the DB (default: the
+                 state part is disabled with a loud notice).
+  --states-materialize-unset  also write UNSET / empty lines into the block.
+  --no-readback  skip the verifying re-read after a state write.
+  --states-report-max <n>  per-task state diff lines printed (default 200).
+
+exit codes: 0 ok | 1 fetch/apply failure | 2 usage or configuration | 4 a local
+state value was refused (outside its closed vocabulary) or a remote block could
+not be rewritten safely | 5 the remote rejected the credentials.
 
 env (injected by the consumer; token value is never printed):
   CLICKUP_API_KEY    personal token (required)
@@ -110,6 +134,15 @@ func runReconcile(args []string) int {
 	stopOnErr := fs.Bool("stop-on-error", false, "with --apply: halt after the first failing item")
 	applyLog := fs.String("apply-log", "", "with --apply: append per-item JSONL outcomes here")
 	minIntervalMS := fs.Int("min-interval-ms", int(client.DefaultMinInterval/time.Millisecond), "minimum ms between ClickUp requests")
+	specPath := fs.String("states-spec", os.Getenv("TASK_BRIDGE_STATES_SPEC"), "JSON spec of the state fields")
+	carrierFlag := fs.String("carrier", envOr("TASK_BRIDGE_STATES_CARRIER", "auto"), "state carrier: auto|block|field")
+	createFields := fs.Bool("create-missing-fields", os.Getenv("TASK_BRIDGE_CREATE_FIELDS") == "1", "with --apply: create missing custom fields (guarded)")
+	maxCreates := fs.Int("max-field-creates", 0, "cap on custom-field creations per list (0 = spec size)")
+	statesOnly := fs.Bool("states-only", false, "with --apply: write only state fields of existing tasks")
+	statesStrict := fs.Bool("states-strict", false, "exit 2 when a spec column is absent from the DB")
+	materialize := fs.Bool("states-materialize-unset", false, "also write UNSET / empty lines into the block")
+	noReadback := fs.Bool("no-readback", false, "skip the verifying re-read after a state write")
+	reportMax := fs.Int("states-report-max", 200, "per-task state diff lines printed")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -131,10 +164,40 @@ func runReconcile(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	local, err := localstore.LoadItems(ctx, *dbPath)
+	var spec *states.Spec
+	var extraCols []string
+	if *specPath != "" {
+		raw, err := os.ReadFile(*specPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reconcile: read states spec: %v\n", err)
+			return 2
+		}
+		if spec, err = states.LoadSpec(raw); err != nil {
+			fmt.Fprintf(os.Stderr, "reconcile: %v\n", err)
+			return 2
+		}
+		extraCols = spec.Keys()
+	} else if *statesOnly || *createFields {
+		fmt.Fprintln(os.Stderr, "reconcile: --states-only / --create-missing-fields need --states-spec")
+		return 2
+	}
+	mode, err := states.ParseMode(*carrierFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "reconcile: %v\n", err)
+		return 2
+	}
+	local, absent, err := localstore.LoadItemsExtra(ctx, *dbPath, extraCols)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "reconcile: load local items: %v\n", err)
 		return 1
+	}
+	if spec != nil && len(absent) > 0 {
+		fmt.Printf("STATES DISABLED: the items table has no column(s) %s (the state columns have not landed in this DB); the run continues WITHOUT state fields\n", strings.Join(absent, ","))
+		if *statesStrict || *statesOnly {
+			fmt.Fprintln(os.Stderr, "reconcile: state columns absent and --states-strict / --states-only given")
+			return 2
+		}
+		spec = nil
 	}
 	allLocalCount := len(local)
 	local = filterByPrefix(local, *prefixCSV)
@@ -144,18 +207,46 @@ func runReconcile(args []string) int {
 	cl := client.NewClickUpWithOptions(token, client.Options{
 		BaseURL:     os.Getenv("TASK_BRIDGE_BASE_URL"), // tests/proxies only; empty = production
 		MinInterval: time.Duration(*minIntervalMS) * time.Millisecond,
+		StatesMode:  spec != nil,
 	})
+	var sc *syncengine.StatesContext
+	var prov syncengine.ProvisionReport
+	if spec != nil {
+		scl, ok := cl.(client.StatesClient)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "reconcile: the transport does not support state fields")
+			return 2
+		}
+		sc, prov, err = syncengine.PrepareStates(ctx, scl, *listID, spec, syncengine.PrepareOptions{
+			Mode: mode, CreateMissing: *createFields, Apply: *apply, MaxCreates: *maxCreates, MaterializeUnset: *materialize,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reconcile: prepare state fields: %v\n", err)
+			if client.IsAuth(err) {
+				return exitAuth
+			}
+			printProvision(prov)
+			return 2
+		}
+	}
 	remote, err := syncengine.FetchAllRemote(ctx, cl, *listID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "reconcile: fetch remote tasks: %v\n", err)
+		if client.IsAuth(err) {
+			return exitAuth
+		}
 		return 1
 	}
 
-	plan := syncengine.PlanReconcile(local, remote)
+	plan := syncengine.PlanReconcileWith(local, remote, syncengine.PlanOptions{States: sc})
 	printReport(*listID, len(local), len(remote), plan, *apply)
+	if sc != nil {
+		printProvision(prov)
+		printStates(plan, *reportMax)
+	}
 
 	if *outPath != "" {
-		if err := writeArtifact(*outPath, *listID, len(local), len(remote), plan); err != nil {
+		if err := writeArtifact(*outPath, *listID, len(local), len(remote), plan, sc, prov); err != nil {
 			fmt.Fprintf(os.Stderr, "reconcile: write artifact: %v\n", err)
 			return 1
 		}
@@ -164,7 +255,8 @@ func runReconcile(args []string) int {
 
 	if *apply {
 		fmt.Println("\n--apply: performing GATED push (create + status-update; never delete)…")
-		opts := syncengine.ApplyOptions{Limit: *limit, StopOnError: *stopOnErr, NewestFirst: *newestFirst}
+		opts := syncengine.ApplyOptions{Limit: *limit, StopOnError: *stopOnErr, NewestFirst: *newestFirst,
+			States: sc, StatesOnly: *statesOnly, VerifyReadback: sc != nil && !*noReadback}
 		var logf *os.File
 		if *applyLog != "" {
 			f, err := os.OpenFile(*applyLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
@@ -196,9 +288,40 @@ func runReconcile(args []string) int {
 		// N2 / §11.4.1: per-item push failures MUST surface as a non-zero exit —
 		// Apply collects them WITHOUT returning a top-level error, so the CLI is
 		// the layer that must NOT report silent partial success.
-		return exitForApply(res)
+		if res.AuthRejected {
+			fmt.Fprintln(os.Stderr, "reconcile: the remote rejected the credentials (HTTP 401/403); batch stopped")
+			return exitAuth
+		}
+		if rc := exitForApply(res); rc != 0 {
+			return rc
+		}
+	}
+	return exitForStates(plan)
+}
+
+// exitAuth is the exit code of a credentials rejection; exitStatesRefused the
+// code of a refused state value or an unsafe remote block. They are distinct so
+// a wrapper can tell "fix the token" from "fix the data" from "retry".
+const (
+	exitAuth          = 5
+	exitStatesRefused = 4
+)
+
+// exitForStates is non-zero when the plan holds a refused state part: a local
+// value outside its closed vocabulary, a malformed remote block, or a task that
+// returned only a plain description. Pure so it is unit-testable.
+func exitForStates(plan syncengine.Plan) int {
+	if plan.StateCounts().Refused > 0 {
+		return exitStatesRefused
 	}
 	return 0
+}
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
 }
 
 // exitForApply maps a gated-push result to the process exit code: any collected
@@ -274,9 +397,15 @@ type artifact struct {
 	Counts      map[string]int  `json:"counts"`
 	Plan        syncengine.Plan `json:"plan"`
 	Note        string          `json:"note"`
+	States      *statesArtifact `json:"states,omitempty"`
 }
 
-func writeArtifact(path, listID string, localN, remoteN int, plan syncengine.Plan) error {
+type statesArtifact struct {
+	Provision syncengine.ProvisionReport `json:"provision"`
+	Counts    syncengine.StateCounts     `json:"counts"`
+}
+
+func writeArtifact(path, listID string, localN, remoteN int, plan syncengine.Plan, sc *syncengine.StatesContext, prov syncengine.ProvisionReport) error {
 	a := artifact{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		ListID:      listID,
@@ -285,6 +414,9 @@ func writeArtifact(path, listID string, localN, remoteN int, plan syncengine.Pla
 		Counts:      plan.Counts(),
 		Plan:        plan,
 		Note:        "title-prefix reconcile; DELETE always 0 (never-auto-delete-remote); INVESTIGATE + UNKEYED are operator decisions",
+	}
+	if sc != nil {
+		a.States = &statesArtifact{Provision: prov, Counts: plan.StateCounts()}
 	}
 	b, err := json.MarshalIndent(a, "", "  ")
 	if err != nil {
@@ -338,4 +470,53 @@ func filterByPrefix(items []mapper.LocalItem, prefixCSV string) []mapper.LocalIt
 func notImplemented(cmd, phase string) {
 	fmt.Fprintf(os.Stderr, "task_bridge: %q not implemented (lands in %s)\n", cmd, phase)
 	os.Exit(3)
+}
+
+// printProvision reports how each state field is carried on this list and which
+// custom fields an operator would have to provision (or a guarded create made).
+func printProvision(p syncengine.ProvisionReport) {
+	fmt.Printf("\nstate fields - carrier mode %s:\n", p.Mode)
+	for _, r := range p.Resolutions {
+		extra := ""
+		if r.Reason != "" {
+			extra = "  (" + r.Reason + ")"
+		}
+		fmt.Printf("  %-26s %-5s %s%s\n", r.Key, r.Carrier, r.Status, extra)
+	}
+	if len(p.WouldCreate) > 0 {
+		fmt.Printf("  DRY-RUN: --create-missing-fields with --apply WOULD try to create: %s\n", strings.Join(p.WouldCreate, ", "))
+	}
+	if len(p.Created) > 0 {
+		fmt.Printf("  CREATED custom fields: %s\n", strings.Join(p.Created, ", "))
+	}
+	if p.CreateUnsupported {
+		fmt.Println("  FIELD_CREATE_UNSUPPORTED: the remote offers no custom-field creation; the missing keys use the description block")
+	}
+	for _, e := range p.CreateErrors {
+		fmt.Printf("  FIELD_CREATE_ERROR: %s\n", e)
+	}
+	if len(p.ToProvision) > 0 {
+		fmt.Println("  to use the FIELD carrier an operator provisions these custom fields on the list (exact name, type, options):")
+		for _, pr := range p.ToProvision {
+			opt := ""
+			if len(pr.Options) > 0 {
+				opt = "  options: " + strings.Join(pr.Options, ", ")
+			}
+			fmt.Printf("    %-26s %-9s%s\n", pr.Key, pr.Type, opt)
+		}
+	}
+}
+
+// printStates prints the per-task state diff (dry-run default) and the totals.
+func printStates(plan syncengine.Plan, max int) {
+	c := plan.StateCounts()
+	fmt.Printf("\nstate-field diff: tasks_with_drift=%d create_rows_with_state=%d field_ops=%d block_ops=%d refused=%d (invalid_value=%d malformed_block=%d no_markdown_source=%d)\n",
+		c.Drift, c.OnCreate, c.FieldOps, c.BlockOps, c.Refused, c.Invalid, c.Malformed, c.NoSource)
+	lines, omitted := plan.StateReportLines(max)
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+	if omitted > 0 {
+		fmt.Printf("  ... and %d more task(s) (the full list is in the --out artifact)\n", omitted)
+	}
 }

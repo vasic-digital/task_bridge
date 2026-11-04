@@ -12,7 +12,11 @@
 // project-specific constant.
 package client
 
-import "context"
+import (
+	"context"
+
+	"github.com/vasic-digital/task_bridge/pkg/states"
+)
 
 // Task is the engine-internal, transport-neutral view of a remote task. The
 // mapper (pkg/mapper) translates between this and the local workable-items
@@ -26,6 +30,14 @@ type Task struct {
 	CustomID      string
 	DateUpdatedMS int64             // ClickUp date_updated (Unix ms) — freshness signal
 	CustomFields  map[string]string // including the ItemKeyCustomField value
+	// DescriptionSource says what Description is: "markdown" (the Markdown
+	// source), "plain" (only a rendered plain text was returned) or "empty".
+	// Empty for tasks built by tests that do not care.
+	DescriptionSource string
+	// Fields holds the task's custom-field values by custom-field id, decoded
+	// from the API response (drop-down option names resolved). Nil when the
+	// transport did not decode them.
+	Fields map[string]states.RemoteField
 }
 
 // Client is the transport contract the sync engine depends on. Keeping it an
@@ -87,3 +99,26 @@ func (stubClient) SetCustomField(context.Context, string, string, string) error 
 func (stubClient) AddTag(context.Context, string, string) error    { return ErrNotImplemented }
 func (stubClient) RemoveTag(context.Context, string, string) error { return ErrNotImplemented }
 func (stubClient) DeleteTask(context.Context, string) error        { return ErrNotImplemented }
+
+// StatesClient is the OPTIONAL extension a transport implements to carry the
+// consumer-defined state fields (pkg/states): custom-field discovery, guarded
+// creation, value set/clear, and a Markdown description write. The engine type-
+// asserts for it, so transports and test fakes that predate it keep compiling;
+// when a states Spec is configured and the Client lacks it, the run fails
+// closed before any write.
+type StatesClient interface {
+	// ListFields returns the custom fields a list exposes (GET /list/{id}/field).
+	ListFields(ctx context.Context, listID string) ([]states.FieldDef, error)
+	// CreateField creates a custom field on a list. ClickUp documents no such
+	// endpoint, so an implementation returns ErrFieldCreateUnsupported when the
+	// remote refuses; callers then fall back to the description block.
+	CreateField(ctx context.Context, listID string, def states.FieldDef) (states.FieldDef, error)
+	// SetFieldValue sets one custom-field value (POST /task/{id}/field/{fid}).
+	// value is the option id for a drop_down and a string for text.
+	SetFieldValue(ctx context.Context, taskID, fieldID string, value interface{}) error
+	// ClearFieldValue removes a custom-field value (DELETE /task/{id}/field/{fid}).
+	ClearFieldValue(ctx context.Context, taskID, fieldID string) error
+	// SetDescription replaces the task's Markdown description (PUT /task/{id}
+	// with markdown_description). It never touches name, status or tags.
+	SetDescription(ctx context.Context, taskID, markdown string) error
+}

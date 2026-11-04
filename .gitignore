@@ -37,3 +37,7 @@ go.work.sum
 .idea/
 .vscode/
 coverage.out
+
+# python bytecode written by scripts/*.py test runs (state-field sync tests)
+__pycache__/
+*.pyc

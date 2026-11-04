@@ -15,6 +15,7 @@ import (
 
 	"github.com/vasic-digital/task_bridge/pkg/client"
 	"github.com/vasic-digital/task_bridge/pkg/mapper"
+	"github.com/vasic-digital/task_bridge/pkg/states"
 )
 
 // ActionKind is the reconcile bucket a row lands in.
@@ -65,6 +66,17 @@ type PlanEntry struct {
 	// Type/other tags are never touched (mapper.IsStatusLabel gates removal).
 	RemoteTags []string `json:"remote_tags,omitempty"`
 	Detail     string   `json:"detail,omitempty"` // human reason (display only)
+	// StateDiff is the difference of the consumer-defined state fields (nil when
+	// the feature is off). StateDrift is the typed flag Apply keys off: something
+	// must be written. A StateDiff with Refusals is reported and makes the run
+	// exit non-zero, but writes nothing for the task's state part.
+	StateDiff  *states.Diff `json:"state_diff,omitempty"`
+	StateDrift bool         `json:"state_drift,omitempty"`
+	// RemoteDescription is the matched task's description text (Markdown source
+	// when RemoteDescSource says so). It is held in memory for the block rewrite
+	// and never serialised into the artifact.
+	RemoteDescription string                        `json:"-"`
+	RemoteFields      map[string]states.RemoteField `json:"-"`
 }
 
 // Plan is the bucketed reconcile diff.
@@ -125,9 +137,21 @@ func itemTieKey(li mapper.LocalItem) string {
 	return li.Location + "\x00" + li.Status + "\x00" + li.Title + "\x00" + li.Description
 }
 
+// PlanOptions carries the optional state-field context of a plan.
+type PlanOptions struct {
+	// States, when non-nil, adds the state-field diff to every matched and every
+	// new task. Nil = the original plan, byte for byte.
+	States *StatesContext
+}
+
 // PlanReconcile computes the DIFF (no writes). Matching is by the `[XXX-NNN]`
 // title-prefix key. Deterministic: every bucket is sorted (§11.4.50).
 func PlanReconcile(local []mapper.LocalItem, remote []client.Task) Plan {
+	return PlanReconcileWith(local, remote, PlanOptions{})
+}
+
+// PlanReconcileWith is PlanReconcile plus the optional state-field diff.
+func PlanReconcileWith(local []mapper.LocalItem, remote []client.Task, po PlanOptions) Plan {
 	byKey := indexLocal(local)
 	matched := make(map[string]bool, len(byKey))
 	var plan Plan
@@ -189,6 +213,23 @@ func PlanReconcile(local []mapper.LocalItem, remote []client.Task) Plan {
 		if e.TitleDrift && !e.InSync && !(colMatch && lblMatch) {
 			e.Detail += "; title-drift"
 		}
+		if po.States != nil {
+			d, _ := po.States.stateDiffFor(li, remoteStateOf(t))
+			e.StateDiff = &d
+			e.StateDrift = d.Drift()
+			e.RemoteDescription = t.Description
+			e.RemoteFields = t.Fields
+			if e.StateDrift {
+				if e.InSync {
+					e.InSync = false
+					e.Detail = "state-drift: " + d.DiffSummary()
+				} else {
+					e.Detail += "; state-drift: " + d.DiffSummary()
+				}
+			} else if d.Refused() {
+				e.Detail += "; state-refused: " + d.DiffSummary()
+			}
+		}
 		plan.Update = append(plan.Update, e)
 	}
 
@@ -197,12 +238,21 @@ func PlanReconcile(local []mapper.LocalItem, remote []client.Task) Plan {
 		if matched[li.Key] {
 			continue
 		}
-		plan.Create = append(plan.Create, PlanEntry{
+		ce := PlanEntry{
 			Kind:        ActionCreate,
 			Key:         li.Key,
 			LocalStatus: li.Status,
 			Detail:      "local item with no remote task — push would create",
-		})
+		}
+		if po.States != nil {
+			d, _ := po.States.stateDiffFor(li, states.RemoteState{DescSource: states.DescEmpty})
+			ce.StateDiff = &d
+			ce.StateDrift = d.Drift()
+			if ce.StateDrift {
+				ce.Detail += "; state: " + d.DiffSummary()
+			}
+		}
+		plan.Create = append(plan.Create, ce)
 	}
 
 	sortEntries(plan.Update)
@@ -247,6 +297,9 @@ type ApplyResult struct {
 	Remaining int
 	// Stopped is true when StopOnError halted the batch on the first failing item.
 	Stopped bool
+	// AuthRejected is true when the batch stopped because the remote rejected the
+	// credentials (HTTP 401/403).
+	AuthRejected bool
 }
 
 // ApplyOptions bounds a gated push. The zero value reproduces the original
@@ -262,6 +315,16 @@ type ApplyOptions struct {
 	NewestFirst bool
 	// OnEvent, when set, is called once per item with its outcome (audit log).
 	OnEvent func(ApplyEvent)
+	// States, when non-nil, applies the state-field diff of every item. The
+	// Client must implement client.StatesClient or ApplyWith refuses to start.
+	States *StatesContext
+	// StatesOnly restricts a gated push to the state fields of EXISTING tasks:
+	// no CREATE, and no status / title / label / name update. It is the staged
+	// roll-out switch.
+	StatesOnly bool
+	// VerifyReadback re-reads each task after a state write and fails the item
+	// when the diff does not converge to empty.
+	VerifyReadback bool
 }
 
 // ApplyEvent is one per-item outcome, handed to ApplyOptions.OnEvent. It never
@@ -312,15 +375,31 @@ func ApplyWith(ctx context.Context, cl client.Client, mp mapper.Mapper, listID s
 	byKey := indexLocal(local)
 	res := ApplyResult{CreatedIDs: map[string]string{}, UpdatedIDs: map[string]string{}}
 
+	var scl client.StatesClient
+	if opts.States != nil {
+		var ok bool
+		if scl, ok = cl.(client.StatesClient); !ok {
+			return res, fmt.Errorf("apply: states configured but the client does not implement client.StatesClient")
+		}
+	}
+	if opts.StatesOnly && opts.States == nil {
+		return res, fmt.Errorf("apply: StatesOnly without a states context")
+	}
 	var work []applyWork
-	for _, e := range plan.Create {
-		work = append(work, applyWork{ActionCreate, e})
+	if !opts.StatesOnly {
+		for _, e := range plan.Create {
+			work = append(work, applyWork{ActionCreate, e})
+		}
 	}
 	for _, e := range plan.Update {
 		// Skip only when status column, status label AND title already match
 		// (InSync). Keyed off the TYPED InSync flag, never the human-readable
-		// Detail string (N3).
-		if e.InSync {
+		// Detail string (N3). Under StatesOnly only a state drift is actionable.
+		if opts.StatesOnly {
+			if !e.StateDrift {
+				continue
+			}
+		} else if e.InSync {
 			continue
 		}
 		work = append(work, applyWork{ActionUpdate, e})
@@ -350,6 +429,7 @@ func ApplyWith(ctx context.Context, cl client.Client, mp mapper.Mapper, listID s
 		e := w.entry
 		li, ok := byKey[e.Key]
 		var errs []string
+		authStop := false
 		switch w.kind {
 		case ActionCreate:
 			if !ok {
@@ -361,27 +441,57 @@ func ApplyWith(ctx context.Context, cl client.Client, mp mapper.Mapper, listID s
 				errs = append(errs, fmt.Sprintf("CREATE %s: map: %v", e.Key, err))
 				break
 			}
+			createDesc := rt.Description
+			var cd states.Diff
+			var cvals states.Values
+			if opts.States != nil {
+				var probs []states.Problem
+				cd, probs = opts.States.stateDiffFor(li, states.RemoteState{DescSource: states.DescEmpty})
+				if len(probs) == 0 {
+					cvals = opts.States.Spec.Normalize(li.States).Values
+					if cd.BlockOp == states.BlockAdd {
+						createDesc = states.Compose(rt.Description, opts.States.Spec.RenderBlock(cd.BlockKeys, cvals, opts.States.Options.MaterializeUnset))
+					}
+				}
+			}
 			created, err := cl.CreateTask(ctx, listID, client.Task{
-				Name: rt.Name, Description: rt.Description, Status: rt.Status, Tags: rt.Tags,
+				Name: rt.Name, Description: createDesc, Status: rt.Status, Tags: rt.Tags,
 			})
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("CREATE %s: %v", e.Key, err))
+				if client.IsAuth(err) {
+					authStop = true
+				}
 				break
 			}
 			res.Created++
 			res.CreatedIDs[e.Key] = created.ID
 			emit(ApplyEvent{Op: "CREATE", Key: e.Key, TaskID: created.ID, OK: true, Detail: "status=" + rt.Status})
+			if opts.States != nil && cd.Drift() && !cd.Refused() {
+				_, serrs, sauth := applyStateWrites(ctx, scl, opts.States, e.Key, created.ID, cd, cvals, "", false)
+				errs = append(errs, serrs...)
+				authStop = authStop || sauth
+				if len(serrs) == 0 && opts.VerifyReadback {
+					verrs, vauth := verifyStates(ctx, cl, opts.States, li, e.Key, created.ID, "create")
+					errs = append(errs, verrs...)
+					authStop = authStop || vauth
+				}
+			}
 		case ActionUpdate:
 			if !ok {
 				break
 			}
 			rt, err := mp.ToRemote(li)
-			if err != nil {
+			if err != nil && !opts.StatesOnly {
 				errs = append(errs, fmt.Sprintf("UPDATE %s: map: %v", e.Key, err))
 				break
 			}
 			touched := false
-			colDrift := !mapper.RemoteStatusMatchesLocal(e.RemoteStatus, li.Status)
+			// descBase is set when the full update below overwrote the remote
+			// description with the local one: the managed block is then gone and
+			// must be re-added on top of exactly that text.
+			var descBase *string
+			colDrift := !mapper.RemoteStatusMatchesLocal(e.RemoteStatus, li.Status) && !opts.StatesOnly
 			// (1) column: push only when the grouped column drifted (the update
 			// body DOES honour `status`, verified live 2026-07-27). This full
 			// update also carries the corrected name.
@@ -390,14 +500,20 @@ func ApplyWith(ctx context.Context, cl client.Client, mp mapper.Mapper, listID s
 					ID: e.TaskID, Name: rt.Name, Description: rt.Description, Status: rt.Status, Tags: rt.Tags,
 				}); err != nil {
 					errs = append(errs, fmt.Sprintf("UPDATE %s: %v", e.Key, err))
+					authStop = authStop || client.IsAuth(err)
 					break
 				}
 				touched = true
-			} else if e.TitleDrift {
+				if rt.Description != "" {
+					base := rt.Description
+					descBase = &base
+				}
+			} else if e.TitleDrift && !opts.StatesOnly {
 				// (1b) title-only drift: NAME-ONLY update (empty description /
 				// status / tags are omitted from the request body).
 				if err := cl.UpdateTask(ctx, client.Task{ID: e.TaskID, Name: mapper.RemoteTitle(li)}); err != nil {
 					errs = append(errs, fmt.Sprintf("UPDATE %s: title: %v", e.Key, err))
+					authStop = authStop || client.IsAuth(err)
 					break
 				}
 				touched = true
@@ -408,12 +524,13 @@ func ApplyWith(ctx context.Context, cl client.Client, mp mapper.Mapper, listID s
 			// SUPERSEDED status label, then add the wanted one if absent.
 			// Type/other tags are never touched (mapper.IsStatusLabel gates
 			// removal).
-			if wantLbl, hasLbl := mapper.StatusLabel(li.Status); hasLbl {
+			if wantLbl, hasLbl := mapper.StatusLabel(li.Status); hasLbl && !opts.StatesOnly {
 				failed := false
 				for _, tg := range e.RemoteTags {
 					if mapper.IsStatusLabel(tg) && !strings.EqualFold(strings.TrimSpace(tg), wantLbl) {
 						if err := cl.RemoveTag(ctx, e.TaskID, tg); err != nil {
 							errs = append(errs, fmt.Sprintf("UPDATE %s: remove stale label %q: %v", e.Key, tg, err))
+							authStop = authStop || client.IsAuth(err)
 							failed = true
 							continue
 						}
@@ -423,8 +540,36 @@ func ApplyWith(ctx context.Context, cl client.Client, mp mapper.Mapper, listID s
 				if !failed && !remoteHasTag(e.RemoteTags, wantLbl) {
 					if err := cl.AddTag(ctx, e.TaskID, wantLbl); err != nil {
 						errs = append(errs, fmt.Sprintf("UPDATE %s: add label %q: %v", e.Key, wantLbl, err))
+						authStop = authStop || client.IsAuth(err)
 					} else {
 						touched = true
+					}
+				}
+			}
+			// (3) state fields: custom-field sets/clears and the managed description
+			// block, written AFTER the steps above so a description overwrite in (1)
+			// can be repaired in the same pass.
+			if opts.States != nil && e.StateDiff != nil && !authStop {
+				sd := *e.StateDiff
+				base := states.Compose(opts.States.Spec.ParseBlock(e.RemoteDescription).Base, "")
+				if descBase != nil {
+					base = states.Compose(*descBase, "")
+					src := states.DescMarkdown
+					if *descBase == "" {
+						src = states.DescEmpty
+					}
+					sd, _ = opts.States.stateDiffFor(li, states.RemoteState{Description: *descBase, DescSource: src, Fields: e.RemoteFields})
+				}
+				if sd.Drift() {
+					vals := opts.States.Spec.Normalize(li.States).Values
+					wrote, serrs, sauth := applyStateWrites(ctx, scl, opts.States, e.Key, e.TaskID, sd, vals, base, true)
+					errs = append(errs, serrs...)
+					authStop = authStop || sauth
+					touched = touched || wrote
+					if wrote && len(serrs) == 0 && opts.VerifyReadback {
+						verrs, vauth := verifyStates(ctx, cl, opts.States, li, e.Key, e.TaskID, "update")
+						errs = append(errs, verrs...)
+						authStop = authStop || vauth
 					}
 				}
 			}
@@ -438,7 +583,13 @@ func ApplyWith(ctx context.Context, cl client.Client, mp mapper.Mapper, listID s
 			res.Errors = append(res.Errors, m)
 			emit(ApplyEvent{Op: string(w.kind), Key: e.Key, TaskID: e.TaskID, OK: false, Err: m})
 		}
-		if len(errs) > 0 && opts.StopOnError {
+		if authStop {
+			res.AuthRejected = true
+		}
+		if len(errs) > 0 && (opts.StopOnError || authStop) {
+			// A credentials rejection (401/403) stops the batch even without
+			// StopOnError: no later item can succeed, and retrying each one only
+			// burns the rate limit.
 			res.Stopped = true
 			res.Remaining = total - (idx + 1)
 			return res, nil

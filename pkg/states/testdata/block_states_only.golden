@@ -1,0 +1,4 @@
+[TB-STATES:BEGIN v1] managed by task_bridge from the tracker database; edit it there, not here
+reproduction_state: reproduced-live
+investigation_state: in-progress
+[TB-STATES:END]

@@ -1,0 +1,9 @@
+[TB-STATES:BEGIN v1] managed by task_bridge from the tracker database; edit it there, not here
+reproduction_state: reproduced-live
+investigation_state: in-progress
+reproduction_evidence: qa-results/atm1/run.txt
+reproduction_red_cmd: bash gate.sh --mutant 3\nexpect: FAIL
+reproduction_green_cmd: bash gate.sh
+reproduction_env: Orange Pi 5 Max, image 1.0.0-dev-0.3.5
+investigation_root_cause: path C:\\tmp\\x and [link](u) * _x_
+[TB-STATES:END]

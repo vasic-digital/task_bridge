@@ -38,6 +38,13 @@ a fake). Architecture + the full phased plan live in the consumer's
 | `scripts/` | `task_bridge_sync.sh`, `task_bridge_init.sh` — consumer-facing wrappers |
 | `docs/` | Architecture + API reference skeleton |
 
+## State fields (optional)
+
+A consumer can have extra tracker fields (closed-vocabulary states and free-text details) carried
+to the board, as ClickUp custom fields where the list has them and as a managed description block
+otherwise: see [`docs/STATES_SYNC.md`](docs/STATES_SYNC.md). It is off unless `--states-spec` (or
+`TASK_BRIDGE_STATES_SPEC`) names the consumer's spec, and then `reconcile` stays dry-run by default.
+
 ## Decoupling contract (§11.4.28)
 
 `task_bridge` knows nothing about any specific project. A consumer wires it by

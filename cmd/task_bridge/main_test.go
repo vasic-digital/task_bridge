@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/vasic-digital/task_bridge/pkg/mapper"
+	"github.com/vasic-digital/task_bridge/pkg/states"
 	"github.com/vasic-digital/task_bridge/pkg/syncengine"
 )
 
@@ -79,5 +80,34 @@ func TestFilterByPrefix(t *testing.T) {
 				t.Errorf("%s: item[%d] = %q, want %q (full got=%v want=%v)", c.name, i, gotKeys[i], c.wantKeys[i], gotKeys, c.wantKeys)
 			}
 		}
+	}
+}
+
+// TestExitForStates: a refused state part makes the exit non-zero (4), an
+// in-vocabulary drift alone does not (it is just work to do), and 4 differs from
+// the apply-failure code 1 and the credentials code 5 so a wrapper can tell them
+// apart.
+func TestExitForStates(t *testing.T) {
+	clean := syncengine.Plan{Update: []syncengine.PlanEntry{{Key: "ATM-1", StateDrift: true, StateDiff: &states.Diff{BlockOp: states.BlockAdd}}}}
+	if rc := exitForStates(clean); rc != 0 {
+		t.Fatalf("drift only: rc = %d, want 0", rc)
+	}
+	refused := syncengine.Plan{Update: []syncengine.PlanEntry{{Key: "ATM-1", StateDiff: &states.Diff{Refusals: []string{"STATE_INVALID:reproduction_state"}}}}}
+	if rc := exitForStates(refused); rc != 4 {
+		t.Fatalf("refused: rc = %d, want 4", rc)
+	}
+	if exitAuth != 5 || exitStatesRefused == exitAuth || exitStatesRefused == 1 {
+		t.Fatalf("exit codes collide: auth=%d refused=%d", exitAuth, exitStatesRefused)
+	}
+}
+
+func TestEnvOr(t *testing.T) {
+	t.Setenv("TB_TEST_ENVOR", "")
+	if envOr("TB_TEST_ENVOR", "d") != "d" {
+		t.Fatal("empty must fall back")
+	}
+	t.Setenv("TB_TEST_ENVOR", "v")
+	if envOr("TB_TEST_ENVOR", "d") != "v" {
+		t.Fatal("set value must win")
 	}
 }

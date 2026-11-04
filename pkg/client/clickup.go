@@ -36,6 +36,11 @@ type Options struct {
 	Max429Retries int
 	Sleep         func(time.Duration)
 	Now           func() time.Time
+	// StatesMode switches ListTasks to the explicit request that asks for the
+	// Markdown description source (include_markdown_description=true) and honours
+	// the API's last_page flag, so a managed description block can be read and
+	// rewritten losslessly. Off = the original library call, byte for byte.
+	StatesMode bool
 }
 
 // clickPageSize is ClickUp's fixed v2 page size for list/{id}/task. A page that
@@ -47,7 +52,8 @@ const clickPageSize = 100
 // clickupClient is the live transport. It holds ONLY the injected upstream
 // client — no project-specific state (the decoupling boundary).
 type clickupClient struct {
-	up *clickup.Client
+	up         *clickup.Client
+	statesMode bool
 }
 
 // NewClickUp constructs the live ClickUp-backed Client from the injected token.
@@ -81,7 +87,7 @@ func NewClickUpWithOptions(token string, o Options) Client {
 			up.BaseURL = u
 		}
 	}
-	return &clickupClient{up: up}
+	return &clickupClient{up: up, statesMode: o.StatesMode}
 }
 
 // ListTasks returns one page of tasks for the list. sinceMS>0 restricts to
@@ -89,6 +95,9 @@ func NewClickUpWithOptions(token string, o Options) Client {
 // pull. Closed tasks + subtasks are included so the full board is reconciled.
 // hasMore is true when the page was full (clickPageSize).
 func (c *clickupClient) ListTasks(ctx context.Context, listID string, page int, sinceMS int64) ([]Task, bool, error) {
+	if c.statesMode {
+		return c.listTasksStates(ctx, listID, page, sinceMS)
+	}
 	opts := &clickup.GetTasksOptions{
 		Page:          page,
 		IncludeClosed: true,
@@ -110,6 +119,9 @@ func (c *clickupClient) ListTasks(ctx context.Context, listID string, page int, 
 
 // GetTask fetches a single task by id.
 func (c *clickupClient) GetTask(ctx context.Context, taskID string) (Task, error) {
+	if c.statesMode {
+		return c.getTaskStates(ctx, taskID)
+	}
 	up, _, err := c.up.Tasks.GetTask(ctx, taskID, nil)
 	if err != nil {
 		return Task{}, err
@@ -187,13 +199,22 @@ func fromUpstream(t *clickup.Task) Task {
 	if v, err := strconv.ParseInt(t.DateUpdated, 10, 64); err == nil {
 		updatedMS = v
 	}
+	src := "empty"
+	switch {
+	case t.MarkdownDescription != "":
+		src = "markdown"
+	case t.Description != "":
+		src = "plain"
+	}
 	return Task{
-		ID:            t.ID,
-		Name:          t.Name,
-		Description:   desc,
-		Status:        t.Status.Status,
-		Tags:          tags,
-		CustomID:      t.CustomID,
-		DateUpdatedMS: updatedMS,
+		ID:                t.ID,
+		Name:              t.Name,
+		Description:       desc,
+		Status:            t.Status.Status,
+		Tags:              tags,
+		CustomID:          t.CustomID,
+		DateUpdatedMS:     updatedMS,
+		DescriptionSource: src,
+		Fields:            decodeFields(t.CustomFields),
 	}
 }

@@ -73,7 +73,7 @@
         "bug",
         "status:queued"
       ],
-      "detail": "state-drift: reproduction_state[BLOCK]: \"UNSET\" -\u003e \"blocked-no-device\"; block:ADD",
+      "detail": "state-drift: reproduction_state[BLOCK]: \"UNSET\" -\u003e \"blocked-no-device-with-recorded-blocker\"; block:ADD",
       "state_diff": {
         "changes": [
           {
@@ -81,7 +81,7 @@
             "carrier": "BLOCK",
             "op": "SET",
             "have": "UNSET",
-            "want": "blocked-no-device"
+            "want": "blocked-no-device-with-recorded-blocker"
           }
         ],
         "block_op": "ADD",

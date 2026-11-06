@@ -52,6 +52,12 @@ One line per non-empty field, in spec order. In a value `\` is `\\`, LF is `\n`,
 
 `--states-spec`, `--carrier`, `--create-missing-fields`, `--max-field-creates`, `--states-only`, `--states-strict`, `--states-materialize-unset`, `--no-readback`, `--states-report-max` (and the env names in `.env.example`). Without a spec the run is the original one.
 
+Scoping and duplicate flags (independent of the states feature; all off by default, so a run without them is the original one):
+
+- `--keys ATM-1,ATM-2` (env `TASK_BRIDGE_KEYS`): only these items are created or updated, whatever else the DB holds or the board shows. It applies after `--prefix`. A key that is not in scope (absent from the DB, outside `--prefix`) or not of the shape `PREFIX-NNN` is a usage error (exit 2) before any remote call, never silently dropped.
+- `--desc-marker REGEXP` (env `TASK_BRIDGE_DESC_MARKER`): a regular expression with exactly one capture group, the consumer's description version marker (for example a content-hash line). When the local description carries a marker and the remote description lacks it or carries another value, the task is `description-drift`: `--apply` rewrites name and description (never status or labels; the managed state block is re-added in the same pass; `--states-only` never rewrites the description). Idempotent: once the marker matches the plan is in sync.
+- DUPLICATE: when two or more remote tasks carry the same `[KEY]` of a local item, all of them are listed under `DUPLICATE` (plan artifact member `duplicate`), none is updated, no further task is created for the key, nothing is deleted, and the run exits 6. Which task stays is an operator decision. Keys that no local item owns stay `INVESTIGATE`.
+
 | Exit | Meaning |
 |---|---|
 | 0 | done |
@@ -59,6 +65,7 @@ One line per non-empty field, in spec order. In a value `\` is `\\`, LF is `\n`,
 | 2 | usage or configuration (bad spec, `--carrier field` unmet, `--states-strict` with columns absent) |
 | 4 | a state part was refused: value outside its vocabulary, malformed remote block, or no Markdown source |
 | 5 | the remote rejected the credentials (HTTP 401/403); the batch stops at once |
+| 6 | two or more remote tasks carry the same item key (`DUPLICATE`); nothing is written for those keys |
 
 A DB without the spec's columns prints `STATES DISABLED` and syncs without states (it is never read as "all unset", which would wipe existing remote state).
 

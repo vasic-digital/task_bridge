@@ -53,6 +53,17 @@ reconcile flags:
                  local items DB — without it every board receives a copy of
                  EVERY item regardless of context (multi-board fan-out must be
                  scoped per consumer, never assumed by this generic engine).
+  --keys <csv>   comma-separated explicit item keys (ATM-1831,ATM-1832) to include
+                 (or env TASK_BRIDGE_KEYS). Applied AFTER --prefix: only these items
+                 are created or updated, whatever else is in the DB or on the board.
+                 A key that is not in scope (absent from the DB or outside --prefix)
+                 is a usage error (exit 2), never silently dropped.
+  --desc-marker <re>  regular expression with exactly ONE capture group: the
+                 consumer's description version marker (e.g. a content-hash line).
+                 When the local description carries a marker that the remote
+                 description lacks or has with another value, the task is reported as
+                 description-drift and --apply rewrites name + description (never the
+                 status or labels). Or env TASK_BRIDGE_DESC_MARKER. Off by default.
   --apply        GATED real push (create + status/label/title update; never
                  delete). Default: dry-run. This is the REAL push path; the
                  separate "push" subcommand below is a placeholder only.
@@ -86,7 +97,9 @@ state-field flags (the consumer-defined tracker states; off unless --states-spec
 
 exit codes: 0 ok | 1 fetch/apply failure | 2 usage or configuration | 4 a local
 state value was refused (outside its closed vocabulary) or a remote block could
-not be rewritten safely | 5 the remote rejected the credentials.
+not be rewritten safely | 5 the remote rejected the credentials | 6 two or more
+remote tasks carry the same item key (listed under DUPLICATE; none is written,
+none is deleted).
 
 env (injected by the consumer; token value is never printed):
   CLICKUP_API_KEY    personal token (required)
@@ -128,6 +141,8 @@ func runReconcile(args []string) int {
 	dbPath := fs.String("db", os.Getenv("TASK_BRIDGE_DB"), "workable-items DB path")
 	outPath := fs.String("out", "", "write the JSON diff artifact here")
 	prefixCSV := fs.String("prefix", os.Getenv("TASK_BRIDGE_PREFIX"), "comma-separated key-prefix filter (e.g. ATM or MVR,SPK); empty = no filtering")
+	keysCSV := fs.String("keys", os.Getenv("TASK_BRIDGE_KEYS"), "comma-separated explicit item keys; empty = no key filter")
+	descMarker := fs.String("desc-marker", os.Getenv("TASK_BRIDGE_DESC_MARKER"), "regexp with one capture group: the description version marker; empty = off")
 	apply := fs.Bool("apply", false, "GATED real push (default: dry-run)")
 	limit := fs.Int("limit", 0, "with --apply: max actionable items this run (0 = unlimited)")
 	newestFirst := fs.Bool("newest-first", false, "with --apply: order by descending key number")
@@ -204,6 +219,28 @@ func runReconcile(args []string) int {
 	if *prefixCSV != "" {
 		fmt.Printf("prefix filter %q: %d of %d local items in scope for this list\n", *prefixCSV, len(local), allLocalCount)
 	}
+	if strings.TrimSpace(*keysCSV) != "" {
+		inPrefix := len(local)
+		var missing []string
+		local, missing, err = filterByKeys(local, *keysCSV)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reconcile: --keys: %v\n", err)
+			return 2
+		}
+		if len(missing) > 0 {
+			fmt.Fprintf(os.Stderr, "reconcile: --keys: not in scope (absent from the DB or outside --prefix): %s\n", strings.Join(missing, ","))
+			return 2
+		}
+		fmt.Printf("key filter: %d of %d in-prefix local items in scope (%s)\n", len(local), inPrefix, strings.TrimSpace(*keysCSV))
+	}
+	var markerRe *regexp.Regexp
+	if strings.TrimSpace(*descMarker) != "" {
+		markerRe, err = regexp.Compile(*descMarker)
+		if err != nil || markerRe.NumSubexp() != 1 {
+			fmt.Fprintln(os.Stderr, "reconcile: --desc-marker must be a valid regular expression with exactly one capture group")
+			return 2
+		}
+	}
 	cl := client.NewClickUpWithOptions(token, client.Options{
 		BaseURL:     os.Getenv("TASK_BRIDGE_BASE_URL"), // tests/proxies only; empty = production
 		MinInterval: time.Duration(*minIntervalMS) * time.Millisecond,
@@ -238,7 +275,7 @@ func runReconcile(args []string) int {
 		return 1
 	}
 
-	plan := syncengine.PlanReconcileWith(local, remote, syncengine.PlanOptions{States: sc})
+	plan := syncengine.PlanReconcileWith(local, remote, syncengine.PlanOptions{States: sc, DescMarker: markerRe})
 	printReport(*listID, len(local), len(remote), plan, *apply)
 	if sc != nil {
 		printProvision(prov)
@@ -296,7 +333,7 @@ func runReconcile(args []string) int {
 			return rc
 		}
 	}
-	return exitForStates(plan)
+	return exitForPlan(plan)
 }
 
 // exitAuth is the exit code of a credentials rejection; exitStatesRefused the
@@ -305,6 +342,7 @@ func runReconcile(args []string) int {
 const (
 	exitAuth          = 5
 	exitStatesRefused = 4
+	exitDuplicate     = 6
 )
 
 // exitForStates is non-zero when the plan holds a refused state part: a local
@@ -315,6 +353,59 @@ func exitForStates(plan syncengine.Plan) int {
 		return exitStatesRefused
 	}
 	return 0
+}
+
+// exitForPlan is the plan-level exit code: a refused state part (4) outranks
+// duplicate remote keys (6); both are data defects that no retry can cure.
+func exitForPlan(plan syncengine.Plan) int {
+	if rc := exitForStates(plan); rc != 0 {
+		return rc
+	}
+	if len(plan.Duplicate) > 0 {
+		return exitDuplicate
+	}
+	return 0
+}
+
+// keyShapeRe is the genuine item-key shape (mirrors pkg/mapper's keyInTitle).
+var keyShapeRe = regexp.MustCompile(`^[A-Z]{2,}-\d+$`)
+
+// filterByKeys keeps the items whose Key is in keysCSV (exact, upper-case). A key
+// of the wrong shape is an error; a key with no item is returned in missing (the
+// caller decides; it is never silently dropped). Order of items is preserved.
+func filterByKeys(items []mapper.LocalItem, keysCSV string) (out []mapper.LocalItem, missing []string, err error) {
+	want := map[string]bool{}
+	var order []string
+	for _, k := range strings.Split(keysCSV, ",") {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if !keyShapeRe.MatchString(k) {
+			return nil, nil, fmt.Errorf("%q is not an item key (want PREFIX-NNN, e.g. ATM-1831)", k)
+		}
+		if !want[k] {
+			want[k] = true
+			order = append(order, k)
+		}
+	}
+	if len(order) == 0 {
+		return nil, nil, fmt.Errorf("no key in %q", keysCSV)
+	}
+	have := map[string]bool{}
+	out = make([]mapper.LocalItem, 0, len(order))
+	for _, it := range items {
+		if want[it.Key] {
+			out = append(out, it)
+			have[it.Key] = true
+		}
+	}
+	for _, k := range order {
+		if !have[k] {
+			missing = append(missing, k)
+		}
+	}
+	return out, missing, nil
 }
 
 func envOr(k, def string) string {
@@ -350,6 +441,16 @@ func printReport(listID string, localN, remoteN int, plan syncengine.Plan, apply
 	fmt.Printf("  DELETE      %5d  (always 0 — never-auto-delete-remote)\n", c["DELETE"])
 	fmt.Printf("  UNKEYED     %5d  (remote task with no [XXX-NNN] key — operator decision)\n", c["UNKEYED"])
 
+	// DUPLICATE: several remote tasks carry one item key — list every task.
+	if len(plan.Duplicate) > 0 {
+		fmt.Printf("\nDUPLICATE (%d remote tasks share %d item key(s); none is written, none is deleted):\n", len(plan.Duplicate), len(plan.DuplicateKeys()))
+		for _, e := range plan.Duplicate {
+			fmt.Printf("  %-12s task=%s  %q\n", e.Key, e.TaskID, e.RemoteName)
+		}
+	}
+	if n := descDriftCount(plan); n > 0 {
+		fmt.Printf("\ndescription drift: %d task(s) (the local description marker differs from the remote one)\n", n)
+	}
 	// INVESTIGATE is the small keyed-orphan bucket — list them all.
 	if len(plan.Investigate) > 0 {
 		fmt.Println("\nINVESTIGATE (keyed remote orphans):")
@@ -374,6 +475,16 @@ func printReport(listID string, localN, remoteN int, plan syncengine.Plan, apply
 			fmt.Printf("  %-12s %s\n", e.Key, e.Detail)
 		}
 	}
+}
+
+func descDriftCount(plan syncengine.Plan) int {
+	n := 0
+	for _, e := range plan.Update {
+		if e.DescDrift {
+			n++
+		}
+	}
+	return n
 }
 
 func driftSample(update []syncengine.PlanEntry, n int) []syncengine.PlanEntry {

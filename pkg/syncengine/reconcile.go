@@ -10,6 +10,7 @@ package syncengine
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -37,6 +38,12 @@ const (
 	// an `[ATM-DERIVED-*]` task). Distinct from INVESTIGATE: it has no key to
 	// match at all. Needs a separate operator decision; never deleted.
 	ActionUnkeyed ActionKind = "UNKEYED"
+	// ActionDuplicate: two or more remote tasks carry the SAME `[XXX-NNN]` key of
+	// a local item. Every such task is listed, none is updated, no task is
+	// created for the key, and nothing is deleted: which one stays is an operator
+	// decision. It is not part of Counts() (that map is a pinned five-bucket
+	// shape); use Plan.Duplicate and DuplicateKeys().
+	ActionDuplicate ActionKind = "DUPLICATE"
 )
 
 // PlanEntry is one row of the reconcile plan (clean, JSON-serialisable — the
@@ -60,6 +67,13 @@ type PlanEntry struct {
 	// A title-only drift is repaired with a NAME-ONLY update (no description,
 	// status or tag overwrite). ATM-1123.
 	TitleDrift bool `json:"title_drift,omitempty"`
+	// DescDrift is true on an UPDATE row when the consumer-defined description
+	// version marker (PlanOptions.DescMarker, one capture group) differs between
+	// the local description and the remote description: the remote copy was made
+	// from an older (or different) local text. It is only ever set when a marker
+	// is configured and the LOCAL description carries one. A description-only
+	// drift is repaired by a name + description update (no status / tag overwrite).
+	DescDrift bool `json:"desc_drift,omitempty"`
 	// RemoteTags is the matched remote task's current tag set (UPDATE rows only).
 	// Apply uses it to reconcile the status:<word> label without an extra GET:
 	// add the wanted label if absent, remove a SUPERSEDED status label if present.
@@ -86,6 +100,25 @@ type Plan struct {
 	Investigate []PlanEntry `json:"investigate"`
 	Delete      []PlanEntry `json:"delete"`
 	Unkeyed     []PlanEntry `json:"unkeyed"`
+	// Duplicate lists every remote task of a key that more than one remote task
+	// carries (and that a local item owns). Omitted from the JSON when empty so
+	// existing artifacts and goldens stay byte-identical.
+	Duplicate []PlanEntry `json:"duplicate,omitempty"`
+}
+
+// DuplicateKeys returns the sorted distinct keys that more than one remote task
+// carries.
+func (p Plan) DuplicateKeys() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range p.Duplicate {
+		if !seen[e.Key] {
+			seen[e.Key] = true
+			out = append(out, e.Key)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Counts returns the per-bucket sizes (the load-bearing dry-run summary).
@@ -142,6 +175,31 @@ type PlanOptions struct {
 	// States, when non-nil, adds the state-field diff to every matched and every
 	// new task. Nil = the original plan, byte for byte.
 	States *StatesContext
+	// DescMarker, when non-nil, is a regular expression with exactly ONE capture
+	// group: the description version marker of the consumer (for example a
+	// content hash line). The engine knows no marker text of its own.
+	DescMarker *regexp.Regexp
+}
+
+// firstGroup returns the first capture group of the first match of re in s
+// ("" when there is none).
+func firstGroup(re *regexp.Regexp, s string) string {
+	m := re.FindStringSubmatch(s)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+// shortMarker shortens a marker value for the report ("none" when empty).
+func shortMarker(v string) string {
+	if v == "" {
+		return "none"
+	}
+	if len(v) > 12 {
+		return v[:12]
+	}
+	return v
 }
 
 // PlanReconcile computes the DIFF (no writes). Matching is by the `[XXX-NNN]`
@@ -156,6 +214,15 @@ func PlanReconcileWith(local []mapper.LocalItem, remote []client.Task, po PlanOp
 	matched := make(map[string]bool, len(byKey))
 	var plan Plan
 
+	// A key that a local item owns and that MORE THAN ONE remote task carries is a
+	// duplicate: it is reported in full and left alone (see ActionDuplicate).
+	remoteCount := map[string]int{}
+	for _, t := range remote {
+		if k, ok := mapper.ParseKey(t.Name); ok {
+			remoteCount[k]++
+		}
+	}
+
 	for _, t := range remote {
 		key, ok := mapper.ParseKey(t.Name)
 		if !ok {
@@ -169,6 +236,19 @@ func PlanReconcileWith(local []mapper.LocalItem, remote []client.Task, po PlanOp
 			continue
 		}
 		li, found := byKey[key]
+		if found && remoteCount[key] > 1 {
+			matched[key] = true // never CREATE a further task for a key that already has several
+			plan.Duplicate = append(plan.Duplicate, PlanEntry{
+				Kind:         ActionDuplicate,
+				Key:          key,
+				TaskID:       t.ID,
+				LocalStatus:  li.Status,
+				RemoteStatus: t.Status,
+				RemoteName:   t.Name,
+				Detail:       fmt.Sprintf("%d remote tasks carry this key — none is written, none is deleted, operator decision", remoteCount[key]),
+			})
+			continue
+		}
 		if !found {
 			plan.Investigate = append(plan.Investigate, PlanEntry{
 				Kind:         ActionInvestigate,
@@ -195,12 +275,28 @@ func PlanReconcileWith(local []mapper.LocalItem, remote []client.Task, po PlanOp
 		lblMatch := !hasLbl || remoteHasTag(t.Tags, wantLbl)
 		wantTitle := mapper.RemoteTitle(li)
 		e.TitleDrift = strings.TrimSpace(t.Name) != strings.TrimSpace(wantTitle)
+		descNote := ""
+		if po.DescMarker != nil {
+			if lm := firstGroup(po.DescMarker, li.Description); lm != "" {
+				remoteDesc := t.Description
+				if po.States != nil {
+					remoteDesc = po.States.Spec.ParseBlock(t.Description).Base
+				}
+				rm := firstGroup(po.DescMarker, remoteDesc)
+				if rm != lm {
+					e.DescDrift = true
+					descNote = fmt.Sprintf("description-drift: marker local=%s remote=%s", shortMarker(lm), shortMarker(rm))
+				}
+			}
+		}
 		switch {
-		case colMatch && lblMatch && !e.TitleDrift:
+		case colMatch && lblMatch && !e.TitleDrift && !e.DescDrift:
 			e.InSync = true
 			e.Detail = "status in-sync (column + label)"
 		case colMatch && lblMatch && e.TitleDrift:
 			e.Detail = fmt.Sprintf("title-drift: remote=%q want=%q", t.Name, wantTitle)
+		case colMatch && lblMatch && e.DescDrift:
+			e.Detail = descNote
 		case !colMatch:
 			if want, okm := mapper.StatusColumn(li.Status); okm {
 				e.Detail = fmt.Sprintf("status-drift: remote=%q want-column=%q label=%q", t.Status, want, wantLbl)
@@ -212,6 +308,9 @@ func PlanReconcileWith(local []mapper.LocalItem, remote []client.Task, po PlanOp
 		}
 		if e.TitleDrift && !e.InSync && !(colMatch && lblMatch) {
 			e.Detail += "; title-drift"
+		}
+		if e.DescDrift && !(colMatch && lblMatch && !e.TitleDrift) {
+			e.Detail += "; " + descNote
 		}
 		if po.States != nil {
 			d, _ := po.States.stateDiffFor(li, remoteStateOf(t))
@@ -259,6 +358,7 @@ func PlanReconcileWith(local []mapper.LocalItem, remote []client.Task, po PlanOp
 	sortEntries(plan.Create)
 	sortEntries(plan.Investigate)
 	sortEntries(plan.Unkeyed)
+	sortEntries(plan.Duplicate)
 	return plan
 }
 
@@ -500,6 +600,20 @@ func ApplyWith(ctx context.Context, cl client.Client, mp mapper.Mapper, listID s
 					ID: e.TaskID, Name: rt.Name, Description: rt.Description, Status: rt.Status, Tags: rt.Tags,
 				}); err != nil {
 					errs = append(errs, fmt.Sprintf("UPDATE %s: %v", e.Key, err))
+					authStop = authStop || client.IsAuth(err)
+					break
+				}
+				touched = true
+				if rt.Description != "" {
+					base := rt.Description
+					descBase = &base
+				}
+			} else if e.DescDrift && !opts.StatesOnly {
+				// (1a) description-version drift (opt-in marker): name + description
+				// only; the status column and the labels are untouched. The managed
+				// block is gone after this overwrite and is re-added below from descBase.
+				if err := cl.UpdateTask(ctx, client.Task{ID: e.TaskID, Name: rt.Name, Description: rt.Description}); err != nil {
+					errs = append(errs, fmt.Sprintf("UPDATE %s: description: %v", e.Key, err))
 					authStop = authStop || client.IsAuth(err)
 					break
 				}

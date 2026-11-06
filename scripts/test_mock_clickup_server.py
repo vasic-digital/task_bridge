@@ -98,6 +98,17 @@ class TestMockBasics(Base):
         _, b, _ = self.call("GET", "task/t1")
         self.assertNotIn("status:queued", [t["name"] for t in b["tags"]])
 
+    def test_tag_names_are_percent_decoded(self):
+        # a label with a space (status:In progress) is sent as status:In%20progress and must be stored as the decoded, lowercased name
+        self.call("POST", "task/t1/tag/status:In%20progress")
+        _, b, _ = self.call("GET", "task/t1")
+        names = [t["name"] for t in b["tags"]]
+        self.assertIn("status:in progress", names)
+        self.assertNotIn("status:in%20progress", names)
+        self.call("DELETE", "task/t1/tag/status:In%20progress")
+        _, b, _ = self.call("GET", "task/t1")
+        self.assertNotIn("status:in progress", [t["name"] for t in b["tags"]])
+
     def test_dropdown_set_requires_option_id(self):
         self.assertEqual(self.call("POST", "task/t1/field/f1", {"value": "A"})[0], 400)
         self.assertEqual(self.call("POST", "task/t1/field/f1", {"value": "f1-opt1"})[0], 200)

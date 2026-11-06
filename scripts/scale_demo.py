@@ -107,7 +107,7 @@ for phase, apply in (("1 dry-run (empty board)", False), ("2 apply", True), ("3 
 con = sqlite3.connect(db)
 edited = [r[0] for r in con.execute("select atm_id from items where atm_id like 'ATM-%' and reproduction_state is not null and reproduction_state<>'' limit 5")]
 for k in edited:
-    con.execute("UPDATE items SET reproduction_state='blocked-no-device', investigation_state='in-progress' WHERE atm_id=?", (k,))
+    con.execute("UPDATE items SET reproduction_state='blocked-no-device-with-recorded-blocker', investigation_state='in-progress' WHERE atm_id=?", (k,))
 con.commit()
 con.close()
 n0 = len(m.state.log)

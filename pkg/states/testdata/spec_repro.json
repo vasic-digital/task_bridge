@@ -6,7 +6,7 @@
       "key": "reproduction_state",
       "kind": "enum",
       "label": "Reproduction state",
-      "values": ["UNSET", "UNREPRODUCED", "reproduced-live", "reproduced-host-fixture", "not-reproducible-with-evidence", "blocked-no-device"],
+      "values": ["UNSET", "UNREPRODUCED", "reproduced-live", "reproduced-host-fixture", "not-reproducible-with-evidence", "blocked-no-device-with-recorded-blocker"],
       "unset": "UNSET"
     },
     {

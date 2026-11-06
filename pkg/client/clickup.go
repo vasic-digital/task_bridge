@@ -12,6 +12,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -48,6 +49,23 @@ type Options struct {
 // not surface the API's last_page flag), so pagination continues until a short
 // page is seen.
 const clickPageSize = 100
+
+// pathSeg makes one remote-controlled value (a task id taken from a ClickUp
+// response, a tag name taken from a task) safe to be ONE segment of a request
+// path. The upstream library builds "task/%s/tag/%s" by plain string
+// concatenation and then resolves the result against the base URL, so a raw "/",
+// "?", "#" or "../" would change WHICH endpoint is called (path traversal and
+// request forgery with the operator's token). Escaping is the same
+// url.PathEscape that states_http.go already applies to every id it sends; for
+// every legitimate id and label the bytes on the wire are unchanged. "." and ".."
+// survive PathEscape and would still be resolved as dot segments, so they (and
+// the empty string) are refused rather than sent.
+func pathSeg(what, v string) (string, error) {
+	if v == "" || v == "." || v == ".." {
+		return "", fmt.Errorf("refusing to build a ClickUp request path from %s %q", what, v)
+	}
+	return url.PathEscape(v), nil
+}
 
 // clickupClient is the live transport. It holds ONLY the injected upstream
 // client — no project-specific state (the decoupling boundary).
@@ -122,7 +140,11 @@ func (c *clickupClient) GetTask(ctx context.Context, taskID string) (Task, error
 	if c.statesMode {
 		return c.getTaskStates(ctx, taskID)
 	}
-	up, _, err := c.up.Tasks.GetTask(ctx, taskID, nil)
+	id, err := pathSeg("task id", taskID)
+	if err != nil {
+		return Task{}, err
+	}
+	up, _, err := c.up.Tasks.GetTask(ctx, id, nil)
 	if err != nil {
 		return Task{}, err
 	}
@@ -154,7 +176,11 @@ func (c *clickupClient) UpdateTask(ctx context.Context, t Task) error {
 		Status:      t.Status,
 		Tags:        t.Tags,
 	}
-	_, _, err := c.up.Tasks.UpdateTask(ctx, t.ID, nil, req)
+	id, err := pathSeg("task id", t.ID)
+	if err != nil {
+		return err
+	}
+	_, _, err = c.up.Tasks.UpdateTask(ctx, id, nil, req)
 	return err
 }
 
@@ -168,14 +194,30 @@ func (c *clickupClient) SetCustomField(context.Context, string, string, string) 
 // endpoint (the update-task body ignores tags — verified live 2026-07-27). Only
 // ever reached under --apply.
 func (c *clickupClient) AddTag(ctx context.Context, taskID, tag string) error {
-	_, err := c.up.Tags.AddTagToTask(ctx, taskID, tag, nil)
+	id, err := pathSeg("task id", taskID)
+	if err != nil {
+		return err
+	}
+	name, err := pathSeg("tag name", tag)
+	if err != nil {
+		return err
+	}
+	_, err = c.up.Tags.AddTagToTask(ctx, id, name, nil)
 	return err
 }
 
 // RemoveTag detaches a (superseded status:<word>) label from a task. Only ever
 // reached under --apply; never deletes the task (§9/§11.4.122).
 func (c *clickupClient) RemoveTag(ctx context.Context, taskID, tag string) error {
-	_, err := c.up.Tags.RemoveTagToTask(ctx, taskID, tag, nil)
+	id, err := pathSeg("task id", taskID)
+	if err != nil {
+		return err
+	}
+	name, err := pathSeg("tag name", tag)
+	if err != nil {
+		return err
+	}
+	_, err = c.up.Tags.RemoveTagToTask(ctx, id, name, nil)
 	return err
 }
 

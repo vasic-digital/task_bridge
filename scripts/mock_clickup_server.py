@@ -40,7 +40,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 PAGE = 100
 MD_PUNCT = "*_[]()#+!|~<>`"
@@ -298,7 +298,7 @@ class Handler(BaseHTTPRequestHandler):
             if lst is None:
                 return 404, {"err": "Task not found", "ECODE": "ITEM_013"}
             t = lst["tasks"][parts[1]]
-            tag = parts[3].lower()
+            tag = unquote(parts[3]).lower()  # the real service decodes the path segment: a label with a space arrives as %20
             if method == "POST":
                 if tag not in t["tags"]:
                     t["tags"].append(tag)

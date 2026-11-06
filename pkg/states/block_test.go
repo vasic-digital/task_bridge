@@ -64,7 +64,7 @@ func TestBlockRoundTripThroughChannels(t *testing.T) {
 	for name, ch := range channels {
 		for i := 0; i < 400; i++ {
 			raw := map[string]string{
-				"reproduction_state":       []string{"UNSET", "UNREPRODUCED", "reproduced-live", "blocked-no-device"}[r.Intn(4)],
+				"reproduction_state":       []string{"UNSET", "UNREPRODUCED", "reproduced-live", "blocked-no-device-with-recorded-blocker"}[r.Intn(4)],
 				"investigation_state":      []string{"UNSET", "not-started", "in-progress", "closed-no-defect"}[r.Intn(4)],
 				"reproduction_evidence":    randString(r, 50),
 				"reproduction_red_cmd":     randString(r, 50),

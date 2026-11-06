@@ -19,7 +19,7 @@ func TestLoadSpecAccepts(t *testing.T) {
 		t.Fatalf("keys = %v", s.Keys())
 	}
 	f, _ := s.Field("reproduction_state")
-	if strings.Join(f.NonUnsetValues(), ",") != "UNREPRODUCED,blocked-no-device,not-reproducible-with-evidence,reproduced-host-fixture,reproduced-live" {
+	if strings.Join(f.NonUnsetValues(), ",") != "UNREPRODUCED,blocked-no-device-with-recorded-blocker,not-reproducible-with-evidence,reproduced-host-fixture,reproduced-live" {
 		t.Fatalf("non-unset values = %v", f.NonUnsetValues())
 	}
 }

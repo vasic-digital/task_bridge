@@ -409,7 +409,7 @@ func TestPrepareStatesCreationGuards(t *testing.T) {
 func TestPlanWithStatesIsDeterministicAndGolden(t *testing.T) {
 	sc := blockCtx(t)
 	local := []mapper.LocalItem{
-		item("ATM-3", "Queued", map[string]string{"reproduction_state": "blocked-no-device"}),
+		item("ATM-3", "Queued", map[string]string{"reproduction_state": "blocked-no-device-with-recorded-blocker"}),
 		item("ATM-1", "Queued", map[string]string{"reproduction_state": "reproduced-live", "reproduction_red_cmd": "bash r.sh\nsecond"}),
 		item("ATM-2", "In progress", map[string]string{"investigation_state": "bogus"}),
 		item("ATM-5", "Queued", map[string]string{"investigation_state": "in-progress"}),
@@ -470,7 +470,7 @@ func TestStateReportLinesCapAndOrder(t *testing.T) {
 // state, both carriers: one pass converges and a second pass makes no write.
 func TestPropEngineApplyTwiceIsZeroWrites(t *testing.T) {
 	r := rand.New(rand.NewSource(77))
-	rsVals := []string{"UNSET", "UNREPRODUCED", "reproduced-live", "reproduced-host-fixture", "not-reproducible-with-evidence", "blocked-no-device"}
+	rsVals := []string{"UNSET", "UNREPRODUCED", "reproduced-live", "reproduced-host-fixture", "not-reproducible-with-evidence", "blocked-no-device-with-recorded-blocker"}
 	isVals := []string{"UNSET", "not-started", "in-progress", "root-cause-found-with-evidence", "root-cause-unconfirmed", "closed-no-defect"}
 	texts := []string{"", "a", "x y", "line1\nline2", "tab\there", `back\slash`, "[brackets] *star* _under_", "TB-STATES:END", "é漢"}
 	for round := 0; round < 60; round++ {

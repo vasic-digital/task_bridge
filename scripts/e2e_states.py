@@ -47,7 +47,7 @@ ITEMS = {
     "ATM-3": dict(type="Feature", status="Queued", title="gamma", description="", reproduction_state="UNREPRODUCED"),
     "SPK-1": dict(type="Bug", status="Queued", title="delta", description="desc four", investigation_state="closed-no-defect",
                   investigation_root_cause="line1\nline2 *bold* [x] C:\\tmp"),
-    "MVR-1": dict(type="Task", status="Queued", title="eps", description="desc five", reproduction_state="blocked-no-device"),
+    "MVR-1": dict(type="Task", status="Queued", title="eps", description="desc five", reproduction_state="blocked-no-device-with-recorded-blocker"),
 }
 COLUMN = {"Queued": "to do", "In progress": "in progress"}
 
@@ -593,7 +593,7 @@ class TestAllBoards(Base):
         for lid, pre in (("L-ATM", "ATM"), ("L-SPK", "SPK"), ("L-MVR", "MVR")):
             self.assertRC(self.run_tb(list_id=lid, prefix=pre, apply=True, spec=None, env_extra=env), 0)
         self.assertIn("investigation_state: closed-no-defect", self.task("L-SPK", "r-SPK-1")["markdown_description"])
-        self.assertIn("reproduction_state: blocked-no-device", self.task("L-MVR", "r-MVR-1")["markdown_description"])
+        self.assertIn("reproduction_state: blocked-no-device-with-recorded-blocker", self.task("L-MVR", "r-MVR-1")["markdown_description"])
         self.assertNotIn("closed-no-defect", self.task("L-ATM", "r-ATM-1")["markdown_description"])
         spk = self.task("L-SPK", "r-SPK-1")["markdown_description"]
         self.assertIn("investigation_root_cause: line1\\nline2 *bold* [x] C:\\\\tmp", spk)
@@ -643,6 +643,105 @@ class TestUnchangedWithoutSpec(Base):
         self.assertNotIn("state", r.stdout.lower().replace("status", ""))
         self.assertEqual(self.writes(), [])
         self.assertTrue(all("include_markdown_description" not in e["query"] for e in self.log() if e["path"].endswith("/task")))
+
+
+HA = "a" * 64
+HB = "b" * 64
+MARK = r"Content-Sha256:\s*([0-9a-f]{64})"
+
+
+def gh_item(h):
+    return "GitHub-Issue: o/r#5\nContent-Sha256: " + h + "\nbody text"
+
+
+class TestKeysDuplicatesDescription(Base):
+    """--keys scoping, DUPLICATE detection (exit 6) and the opt-in description marker, all against the offline mock."""
+
+    def db_with(self, items):
+        p = os.path.join(self.tmp, "gh.db")
+        make_db(p, items)
+        return p
+
+    def test_keys_scopes_create_to_the_named_items_and_is_idempotent(self):
+        self.seed_atm(tasks=[])
+        r = self.run_tb(apply=True, spec=None, extra=["--keys", "ATM-2"])
+        self.assertRC(r, 0)
+        posts = [e for e in self.writes() if e["method"] == "POST" and e["path"].endswith("/task")]
+        self.assertEqual(len(posts), 1, self.writes())
+        self.assertEqual(self.mock.state.lists["L-ATM"]["tasks"][list(self.mock.state.lists["L-ATM"]["tasks"])[0]]["name"], "[ATM-2] beta")
+        n = self.nlog()
+        self.assertRC(self.run_tb(apply=True, spec=None, extra=["--keys", "ATM-2"]), 0)
+        self.assertEqual(self.writes(n), [], "the second scoped apply must write nothing")
+        # CONTROL (needle): without --keys the same prefix would create the other ATM items too
+        self.seed_atm(tasks=[])
+        self.assertRC(self.run_tb(apply=True, spec=None), 0)
+        self.assertEqual(len([e for e in self.writes() if e["method"] == "POST" and e["path"].endswith("/task")]), 3)
+
+    def test_keys_unknown_or_malformed_is_a_usage_error_before_any_remote_call(self):
+        self.seed_atm(tasks=[])
+        for bad in ("ATM-999", "atm-2", "ATM-2;x"):
+            n = self.nlog()
+            r = self.run_tb(spec=None, extra=["--keys", bad])
+            self.assertRC(r, 2)
+            self.assertEqual(self.log()[n:], [], "a refused --keys must not reach the remote")
+
+    def test_keys_outside_the_prefix_is_a_usage_error(self):
+        self.seed_atm(tasks=[])
+        self.assertRC(self.run_tb(spec=None, extra=["--keys", "SPK-1"]), 2)
+
+    def test_duplicate_remote_keys_exit_6_and_write_nothing(self):
+        two = [remote_task("ATM-2", ITEMS["ATM-2"]), remote_task("ATM-2", ITEMS["ATM-2"], id="r-ATM-2-copy")]
+        self.seed_atm(tasks=two)
+        out = os.path.join(self.tmp, "dup.json")
+        r = self.run_tb(apply=True, spec=None, extra=["--keys", "ATM-2"], out=out)
+        self.assertRC(r, 6)
+        self.assertIn("DUPLICATE", r.stdout)
+        self.assertEqual(self.writes(), [])
+        with open(out) as fh:
+            a = json.load(fh)
+        self.assertEqual(sorted(x["task_id"] for x in a["plan"]["duplicate"]), ["r-ATM-2", "r-ATM-2-copy"])
+        self.assertFalse(a["plan"]["update"], "a duplicated key must not be an UPDATE row")
+        # CONTROL: one task for the same key is exit 0
+        self.seed_atm(tasks=[remote_task("ATM-2", ITEMS["ATM-2"])])
+        self.assertRC(self.run_tb(spec=None, extra=["--keys", "ATM-2"]), 0)
+
+    def test_description_marker_drift_is_applied_once_and_converges(self):
+        items = {"ATM-5": dict(type="Bug", status="Queued", title="gh item", description=gh_item(HA))}
+        db = self.db_with(items)
+        stale = remote_task("ATM-5", dict(items["ATM-5"], description=gh_item(HB)))
+        self.seed_atm(tasks=[stale])
+        r = self.run_tb(db=db, spec=None, extra=["--keys", "ATM-5", "--desc-marker", MARK])
+        self.assertRC(r, 0)
+        self.assertIn("description-drift", r.stdout)
+        self.assertEqual(self.writes(), [], "a dry run must not write")
+        self.assertRC(self.run_tb(db=db, spec=None, apply=True, extra=["--keys", "ATM-5", "--desc-marker", MARK]), 0)
+        self.assertIn(HA, self.task("L-ATM", "r-ATM-5")["markdown_description"])
+        n = self.nlog()
+        r2 = self.run_tb(db=db, spec=None, apply=True, extra=["--keys", "ATM-5", "--desc-marker", MARK])
+        self.assertRC(r2, 0)
+        self.assertNotIn("description-drift", r2.stdout)
+        self.assertEqual(self.writes(n), [], "converged: nothing left to write")
+        # CONTROL: the marker is opt-in; without the flag the stale description is not even reported
+        self.seed_atm(tasks=[stale])
+        r3 = self.run_tb(db=db, spec=None, extra=["--keys", "ATM-5"])
+        self.assertNotIn("description-drift", r3.stdout)
+
+    def test_bad_desc_marker_is_a_usage_error(self):
+        self.seed_atm(tasks=[])
+        self.assertRC(self.run_tb(spec=None, extra=["--desc-marker", "no group"]), 2)
+        self.assertRC(self.run_tb(spec=None, extra=["--desc-marker", "(a)(b)"]), 2)
+        self.assertRC(self.run_tb(spec=None, extra=["--desc-marker", "("]), 2)
+
+    def test_the_short_blocked_spelling_is_refused_and_the_long_one_is_written(self):
+        items = {"ATM-7": dict(type="Task", status="Queued", title="short", description="d", reproduction_state="blocked-no-device"),
+                 "ATM-8": dict(type="Task", status="Queued", title="long", description="d", reproduction_state="blocked-no-device-with-recorded-blocker")}
+        db = self.db_with(items)
+        self.seed_atm(tasks=[remote_task("ATM-7", items["ATM-7"]), remote_task("ATM-8", items["ATM-8"])])
+        r = self.run_tb(db=db, apply=True)
+        self.assertRC(r, 4)
+        self.assertIn("STATE_INVALID:reproduction_state", r.stdout)
+        self.assertNotIn("blocked-no-device", self.task("L-ATM", "r-ATM-7")["markdown_description"], "the refused short spelling must never reach the board")
+        self.assertIn("reproduction_state: blocked-no-device-with-recorded-blocker", self.task("L-ATM", "r-ATM-8")["markdown_description"])
 
 
 if __name__ == "__main__":

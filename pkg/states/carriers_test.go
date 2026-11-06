@@ -108,7 +108,7 @@ func TestResolveTextFieldOfWrongType(t *testing.T) {
 func TestResolveExtraOptionsAllowedAndReported(t *testing.T) {
 	s := mustSpec(t)
 	defs := fullDefs(s)
-	defs[0] = ddDef("cf-rs", "Reproduction State", "UNREPRODUCED", "reproduced-live", "reproduced-host-fixture", "not-reproducible-with-evidence", "blocked-no-device", "UNSET", "legacy-x")
+	defs[0] = ddDef("cf-rs", "Reproduction State", "UNREPRODUCED", "reproduced-live", "reproduced-host-fixture", "not-reproducible-with-evidence", "blocked-no-device-with-recorded-blocker", "UNSET", "legacy-x")
 	p, _ := s.ResolveCarriers(defs, ModeAuto)
 	if p.Res[0].Status != ResOK || strings.Join(p.Res[0].ExtraOptions, ",") != "legacy-x" {
 		t.Fatalf("res = %+v", p.Res[0])

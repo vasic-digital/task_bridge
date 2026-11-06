@@ -200,7 +200,7 @@ func TestPropApplyTwiceIsZeroDiff(t *testing.T) {
 	plans["field"], _ = s.ResolveCarriers(fullDefs(s), ModeAuto)
 	mixed := fullDefs(s)[:3]
 	plans["mixed"], _ = s.ResolveCarriers(mixed, ModeAuto)
-	rsVals := []string{"UNSET", "UNREPRODUCED", "reproduced-live", "reproduced-host-fixture", "not-reproducible-with-evidence", "blocked-no-device"}
+	rsVals := []string{"UNSET", "UNREPRODUCED", "reproduced-live", "reproduced-host-fixture", "not-reproducible-with-evidence", "blocked-no-device-with-recorded-blocker"}
 	isVals := []string{"UNSET", "not-started", "in-progress", "root-cause-found-with-evidence", "root-cause-unconfirmed", "closed-no-defect"}
 	for name, p := range plans {
 		for i := 0; i < 600; i++ {
